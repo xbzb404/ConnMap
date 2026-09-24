@@ -1,0 +1,26 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------- 构建产物 ----------
+build/
+dist/
+_probedist*/
+_probebuild*/
+_probespec*/
+*_old_[0-9]*/
+
+# ---------- 运行 / 开发产物 ----------
+_shots/
+*.log
+geo_cache.json
+_probe.py
+_probe_result.json
+_report_sample.txt
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

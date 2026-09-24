@@ -33,7 +33,7 @@ from connscan import (
 
 APP_NAME = "本机连接地图"
 APP_SUBTITLE = "看每个应用连到了哪个国家 / 机房"
-APP_VERSION = "1.2"
+APP_VERSION = "1.2.1"
 AUTHOR = "by zhb"
 
 # ---------------------------------------------------------------- 设计 token
@@ -1435,6 +1435,7 @@ class App:
 
         self.canvas = tk.Canvas(cvwrap, bg=C["surface"], highlightthickness=0, bd=0)
         vsb = tk.Scrollbar(cvwrap, orient="vertical", command=self.canvas.yview)
+        self._vsb = vsb
         self._hsb = tk.Scrollbar(box, orient="horizontal",
                                  command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=vsb.set)
@@ -1445,13 +1446,16 @@ class App:
         self.rows_inner = tk.Frame(self.canvas, bg=C["surface"])
         self._rows_win = self.canvas.create_window((0, 0), window=self.rows_inner,
                                                    anchor="nw")
-        self.rows_inner.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfigure(
-                self._rows_win, width=max(e.width, self.table_w)))
+        self.rows_inner.bind("<Configure>", self._on_content_resize)
+
+        def on_canvas_resize(e):
+            # 行容器宽度至少要等于「列宽合计」，否则列会被压缩；
+            # 超过可视区就交给横向滚动条。
+            self.canvas.itemconfigure(self._rows_win,
+                                      width=max(e.width, self.table_w))
+            self._on_content_resize()
+
+        self.canvas.bind("<Configure>", on_canvas_resize)
         # 表头与表体横向同步，否则两边错位
         self.canvas.configure(xscrollcommand=self._on_xscroll)
         self.canvas.bind_all("<MouseWheel>", self.on_wheel)
@@ -1469,6 +1473,57 @@ class App:
             self.header.xview_moveto(first)
         except (AttributeError, tk.TclError):
             pass
+
+    def _on_content_resize(self, _event=None):
+        """内容或可视区尺寸变了：重算滚动范围，并决定滚动条显不显示。"""
+        self._update_scrollregion()
+        self._sync_scrollbars()
+
+    def _update_scrollregion(self):
+        """滚动范围的下界取「内容尺寸」与「可视尺寸」的较大者。
+
+        直接用 `bbox("all")` 会把范围设成内容的真实尺寸，内容不足一屏时
+        范围比可视区还小。Tk 在这种情形下其实会自己夹住（实测 yview 恒为
+        0..1、下滚 30 格与 moveto(1.0) 都不动），但范围值本身是反直觉的，
+        滚动条的滑块比例也跟着变得没意义。撑到可视区大小就干净了。
+        """
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+        except tk.TclError:
+            return
+        if cw <= 1 or ch <= 1:        # 窗口还没完成布局，量出来是 1
+            return
+        self.canvas.configure(
+            scrollregion=(0, 0, max(self.table_w, cw),
+                          max(self.rows_inner.winfo_reqheight(), ch)))
+
+    def _sync_scrollbars(self):
+        """内容不溢出时把滚动条收起来。
+
+        滚动条常驻本身就是一种误导：只有一行数据时它照样挂在那里、滑块也在，
+        看着就像「一行也能滑到底」。收掉之后「这里不能滚」一眼可见。
+        """
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+        except tk.TclError:
+            return
+        if cw <= 1 or ch <= 1:
+            return
+        # 用 winfo_manager() 判断有没有被 pack：pack_forget 之后它返回空串。
+        # 不能用 winfo_ismapped() —— 窗口尚未映射时它对所有控件都返回 0，会误判。
+        if self.rows_inner.winfo_reqheight() > ch:
+            if not self._vsb.winfo_manager():
+                self._vsb.pack(side="right", fill="y", padx=(0, 4))
+        elif self._vsb.winfo_manager():
+            self._vsb.pack_forget()
+
+        if self.table_w > cw:
+            if not self._hsb.winfo_manager():
+                self._hsb.pack(fill="x", padx=(14, 14))
+        elif self._hsb.winfo_manager():
+            self._hsb.pack_forget()
 
     # 列定义：表头绘制、点表头反查列、单元格取值三处共用一份，
     # 顺序必须和 ConnRow.values 严格一致 —— 两边靠同一份 widths 累加定位，
@@ -2007,10 +2062,10 @@ class App:
             self.canvas.itemconfigure(
                 self._rows_win,
                 width=max(self.canvas.winfo_width() or 0, self.table_w))
-            self.canvas.configure(
-                scrollregion=self.canvas.bbox("all") or (0, 0, self.table_w, 0))
         except tk.TclError:
             pass
+        # 列宽变了 → 滚动范围与滚动条显不显示都要跟着重算
+        self._on_content_resize()
 
     def render_rows(self):
         self.clear_rows()

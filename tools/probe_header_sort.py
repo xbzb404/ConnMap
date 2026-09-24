@@ -108,6 +108,10 @@ def main():
         check(f"点第 {idx + 1} 列「{text}」→ {key}", inst.sort_col == key,
               f"实际 {inst.sort_col}")
     inst.sort_col, inst.sort_desc = None, False
+    # 表头只在 _draw_header() 时才反映排序状态，apply_filter() 不碰表头。
+    # 只改属性不重绘，表头会留着上一列的箭头 —— 这里曾因此误报
+    # 「未排序时无箭头」失败（真实使用走 cycle_sort，它自己会重绘）。
+    inst._draw_header()
     inst.apply_filter()
 
     print("\n  -- 表头箭头渲染 --")

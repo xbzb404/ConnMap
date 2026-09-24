@@ -3,8 +3,10 @@
 
 纯逻辑，无界面依赖，可命令行独立运行：
 
-    python connscan.py            # 列出全部连接（含本地）
-    python connscan.py --public   # 只列公网连接
+    python connscan.py                   # 只列公网连接（默认）
+    python connscan.py --all             # 含局域网
+    python connscan.py --all --listen    # 再带上本机监听口（TCP LISTENING / UDP `*:*`）
+    python connscan.py --any --listen    # 全部，连环回一起
 
 数据来源是系统自带的 netstat / tasklist，不依赖 psutil 或第三方库。
 两个命令的输出都是 GBK 编码，必须按 GBK 解码，否则中文进程名会乱码。
@@ -32,6 +34,13 @@ NET_LAN = "lan"            # 局域网、私网
 NET_PUBLIC = "public"      # 公网
 NET_MULTICAST = "multicast"  # 组播 / 广播
 NET_UNKNOWN = "unknown"
+# 本机在监听、没有对端的一类（TCP LISTENING / UDP 的 `*:*`）。
+# 单独成一类而不是塞进「本机」：游戏私服、Web 服务这些「我开给别人的口」
+# 全在这一类里，按「本机」归类会让人以为是自己连自己。
+NET_LISTEN = "listen"
+
+# 「不限范围」的哨兵值，给 collect(min_kind=...) 用
+NET_ANY = "any"
 
 NET_LABEL = {
     NET_LOCAL: "本机",
@@ -39,7 +48,13 @@ NET_LABEL = {
     NET_PUBLIC: "公网",
     NET_MULTICAST: "组播",
     NET_UNKNOWN: "未知",
+    NET_LISTEN: "监听",
 }
+
+# UDP / TCP 里表示「没有对端」的远端写法。netstat 在 UDP 监听行写 `*:*`，
+# 偶尔也会把地址写成全零。这些值**不能**当 IP 解析（解析必失败 →
+# 落进 UNKNOWN → 被范围过滤掉，于是本机开的服务器端口永远看不见）。
+WILDCARD_HOSTS = ("", "*", "0.0.0.0", "::", "0:0:0:0:0:0:0:0")
 
 # ---------------------------------------------------------------- 连接状态
 
@@ -75,7 +90,13 @@ def normalize_state(state: str) -> str:
 
 
 def classify_ip(ip: str) -> str:
-    """判断一个 IP 属于哪类网络。无法解析时按「本机」处理，避免误报成公网。"""
+    """判断一个 IP 属于哪类网络。无法解析时按「本机」处理，避免误报成公网。
+
+    通配地址（UDP 监听行的 `*`）也归「本机」——它不是某个外部对端，
+    而是本机自己开着的口。真空值（空串）同理。
+    """
+    if ip in WILDCARD_HOSTS:
+        return NET_LOCAL
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -101,6 +122,12 @@ def split_hostport(text: str):
     text = (text or "").strip()
     if not text:
         return "", 0
+    # netstat 把「没有对端」的 UDP 行远端写作 `*:*`（主机和端口都是 `*`）。
+    # 必须在 rpartition 之前拦掉：否则端口 `*` 转 int 失败，函数会把
+    # 整个串 `*:*` 当作主机名返回，后面无论按通配还是按 IP 判断都对不上，
+    # 整行静默消失 —— 七日杀的 26900/26902 就是这么丢的。
+    if text.startswith("*"):
+        return "*", 0
     if text.startswith("["):
         end = text.find("]")
         if end > 0:
@@ -144,6 +171,38 @@ class Connection:
     # 服务/端口语义
     service: str = ""
     port_hint: str = ""
+    # 这一条是不是「只有本机在听、没有对端」的项（TCP LISTENING / UDP `*:*`）。
+    # 这类行的 remote_ip/remote_port 是空值，展示与排序都必须改用本地地址，
+    # 否则表格里会显示成「服务器 IP：0.0.0.0、端口：0」。
+    listen_only: bool = False
+
+    @property
+    def has_remote(self) -> bool:
+        """有没有真实的远端。空 / 通配都不算。"""
+        return (self.remote_ip not in WILDCARD_HOSTS) and self.remote_port != 0
+
+    @property
+    def is_listen_only(self) -> bool:
+        return (self.listen_only or self.state == "LISTENING"
+                or (self.proto == "UDP" and not self.has_remote))
+
+    @property
+    def display_ip(self) -> str:
+        """表格「服务器 IP」列要显示的值。
+
+        监听项显示本机监听地址（`0.0.0.0` = 所有网卡），
+        这样「谁在哪个口上等连接」一眼能看出，而不是一行空白。
+        """
+        if self.is_listen_only:
+            return self.local_ip or self.remote_ip
+        return self.remote_ip
+
+    @property
+    def display_port(self) -> int:
+        """表格「端口」列要显示的值。监听项看本地端口。"""
+        if self.is_listen_only:
+            return self.local_port
+        return self.remote_port
 
     @property
     def remote_hostport(self) -> str:
@@ -211,11 +270,18 @@ PORT_HINTS = {
     7890: "Clash 代理口",
     7891: "Clash 代理口",
     8080: "HTTP 备用端口",
+    8081: "HTTP 备用端口 / 控制台",
     8443: "HTTPS 备用端口",
     8888: "HTTP 备用端口",
     9000: "服务端口",
     11211: "Memcached 缓存",
+    26900: "七日杀 游戏端口",
+    26901: "七日杀 Steam 查询",
+    26902: "七日杀 查询 / RCON",
+    26903: "七日杀 Web API",
+    27015: "Steam / Source 查询",
     27017: "MongoDB 数据库",
+    27020: "Steam 游戏端口",
 }
 
 # 进程名 → 人话名称。命中就显示更友好的名字。
@@ -231,6 +297,8 @@ PROC_ALIASES = {
     "telegram.exe": "Telegram",
     "discord.exe": "Discord",
     "steam.exe": "Steam",
+    "7daystodie.exe": "七日杀（主机 / 客户端）",
+    "7daystodieserver.exe": "七日杀 专用服务端",
     "u3ds.exe": "Unturned 服务端",
     "steamwebhelper.exe": "Steam 内置浏览器",
     "svchost.exe": "Windows 系统服务宿主",
@@ -353,6 +421,8 @@ PROC_CATEGORY = {
     "feishu.exe": "即时通讯",
     "lark.exe": "即时通讯",
     "steam.exe": "游戏平台",
+    "7daystodie.exe": "游戏服务端",
+    "7daystodieserver.exe": "游戏服务端",
     "u3ds.exe": "游戏服务端",
     "steamwebhelper.exe": "游戏平台",
     "clash.exe": "代理工具",
@@ -555,11 +625,24 @@ def list_connections(include_local: bool = True, include_listening: bool = False
 
         l_ip, l_port = split_hostport(local)
         r_ip, r_port = split_hostport(remote)
-        kind = classify_ip(r_ip)
+
+        # 「只在听、没有对端」的两类：
+        #   TCP  LISTENING  —— 状态本身就是监听
+        #   UDP  `*:*`      —— UDP 没有状态列，远端写作通配
+        wild_remote = (r_ip in WILDCARD_HOSTS) and r_port == 0
+        listen_only = (state == "LISTENING") or (proto == "UDP" and wild_remote)
+
+        # 监听项单独归一类。若交给 classify_ip(r_ip)，`*` 会落进「本机」，
+        # 于是本机开的服务器端口非得切到「含本机」才看得见 —— 可它明明
+        # 是「我开给局域网/外网的口」，该跟局域网档一起出现。
+        kind = NET_LISTEN if listen_only else classify_ip(r_ip)
 
         if not include_local and kind not in (NET_PUBLIC,):
             continue
-        if not include_listening and state == "LISTENING":
+        # include_listening 判断的是「有没有对端」，不是「状态叫什么」。
+        # 只认 state == "LISTENING" 会漏掉全部 UDP 监听行 —— 七日杀的
+        # 26900/26902 恰恰是 UDP 的，这就是「端口开着却搜不到」的直接原因。
+        if not include_listening and listen_only:
             continue
 
         conns.append(Connection(
@@ -567,7 +650,9 @@ def list_connections(include_local: bool = True, include_listening: bool = False
             local_ip=l_ip, local_port=l_port,
             remote_ip=r_ip, remote_port=r_port,
             state=state, pid=pid, net_kind=kind,
-            service=port_hint(r_port),
+            # 监听项的「端口语义」要看本地口：本地 26900 才该提示「七日杀 游戏端口」
+            service=port_hint(l_port if listen_only else r_port),
+            listen_only=listen_only,
         ))
 
     return conns
@@ -578,18 +663,30 @@ def collect(include_local: bool = False, include_listening: bool = False,
             include_system: bool = False) -> list:
     """主入口：枚举连接并补上进程信息。
 
-    min_kind=NET_PUBLIC 时只返回公网连接；=NET_LAN 时连局域网一起返回。
+    min_kind 决定「范围」：
+      NET_PUBLIC —— 只有公网（默认视图）
+      NET_LAN    —— 公网 + 局域网 + 监听口（本机开给别人的服务都在这）
+      NET_ANY    —— 不限，连环回（127.0.0.1）与未知分类一起收
+
+    include_listening=True 才会带上「只在听、没有对端」的项
+    （TCP LISTENING / UDP `*:*`）。默认关掉是因为它们不是「连到哪去了」，
+    但要查「本机服务器的端口有没有起来」就必须打开。
 
     include_stale=False 会丢掉 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_1 / FIN_WAIT_2
     这类已经结束、还挂在表里的残留项——它们不是「当前正在连接」的服务器，
     留着会把结果淹掉（实测 46 条里有一大半是它）。
     include_system=False 会丢掉 PID 0/4 的内核连接表项。
     """
-    allow = {NET_PUBLIC} if min_kind == NET_PUBLIC else {NET_PUBLIC, NET_LAN}
+    if min_kind in (NET_ANY, "all"):
+        allow = None                       # 不限范围，环回与未知一起收
+    elif min_kind == NET_LAN:
+        allow = {NET_PUBLIC, NET_LAN, NET_LISTEN}
+    else:
+        allow = {NET_PUBLIC}
     procs = list_processes()
     out = []
     for c in list_connections(include_local=True, include_listening=include_listening):
-        if c.net_kind not in allow:
+        if allow is not None and c.net_kind not in allow:
             continue
         if not include_stale and c.state in STALE_STATES:
             continue
@@ -672,9 +769,19 @@ def summarize(conns) -> dict:
 
 
 def _main(argv):
-    public_only = "--all" not in argv
-    conns = collect(min_kind=NET_PUBLIC if public_only else NET_LAN,
-                    include_listening=False)
+    """命令行：
+        python connscan.py                  只列公网（默认）
+        python connscan.py --all            含局域网
+        python connscan.py --all --listen   再带上本机监听口（查 26900 用这个）
+        python connscan.py --any --listen   全部，连环回一起
+    """
+    if "--any" in argv:
+        scope = NET_ANY
+    elif "--all" in argv:
+        scope = NET_LAN
+    else:
+        scope = NET_PUBLIC
+    conns = collect(min_kind=scope, include_listening="--listen" in argv)
     procs = {}
     for c in conns:
         procs.setdefault((c.proc_name, c.pid), []).append(c)
@@ -682,9 +789,10 @@ def _main(argv):
     print(f"共 {len(conns)} 条连接，涉及 {len(procs)} 个进程")
     for (name, pid), items in sorted(procs.items(), key=lambda kv: -len(kv[1])):
         print(f"\n[{pid}] {human_proc_name(name)}  ({len(items)} 条)")
-        for c in sorted(items, key=lambda x: x.remote_ip):
+        for c in sorted(items, key=lambda x: (x.display_ip, x.display_port)):
+            mark = "监听" if c.is_listen_only else c.state
             tag = c.service or ""
-            print(f"    {c.remote_hostport:<26} {c.state:<12} {tag}")
+            print(f"    {c.display_ip}:{c.display_port:<16} {mark:<12} {tag}")
 
 
 if __name__ == "__main__":

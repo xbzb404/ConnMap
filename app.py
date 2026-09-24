@@ -27,13 +27,13 @@ import geoloc
 import localproxy
 import winproc
 from connscan import (
-    Connection, NET_LABEL, NET_LAN, NET_LOCAL, NET_PUBLIC,
-    human_proc_name, proc_category,
+    Connection, NET_ANY, NET_LABEL, NET_LAN, NET_LISTEN, NET_LOCAL,
+    NET_PUBLIC, human_proc_name, proc_category,
 )
 
 APP_NAME = "本机连接地图"
 APP_SUBTITLE = "看每个应用连到了哪个国家 / 机房"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 AUTHOR = "by zhb"
 
 # ---------------------------------------------------------------- 设计 token
@@ -808,8 +808,10 @@ class ConnRow:
              conn.scan_state_color(), "small", None),
             # IP / 端口 / PID / 坐标 用 8pt 等宽：9pt 下一整条 IPv4 要 165px，
             # 全表宽度撑不住；降到 8pt 是 135px，正好放得下且不横向滚动。
-            (conn.remote_ip, widths["ip"], "w", C["text"], "mono_sm", None),
-            (str(conn.remote_port), widths["port"], "w",
+            # 监听项没有对端，这里必须用本机监听地址与本地端口：
+            # 否则这两格会一起显示成「0.0.0.0 / 0」，「哪个口在听」就没了。
+            (conn.display_ip, widths["ip"], "w", C["text"], "mono_sm", None),
+            (str(conn.display_port), widths["port"], "w",
              C["text_sub"], "mono_sm", None),
             (str(conn.pid), widths["pid"], "w",
              C["text_muted"], "mono_sm", None),
@@ -1017,17 +1019,35 @@ class App:
         self.geo_progress = (0, 0)
         self.scan_started = 0.0
         self.scan_cost = 0.0
+        # 本次扫描收不收监听项。在主线程取值后交给工作线程用 ——
+        # Tk 的 BooleanVar 不能跨线程读，取值必须发生在主线程。
+        self.scan_listen = True
         self.last_error = ""
         self.proxy_info = None           # localproxy.ProxyInfo，工作线程里探测
-        self.filter_kind = "public"      # public | lan
+        self.filter_kind = "lan"         # public | lan | all
         self.filter_country = None       # None = 全部
         self.search_text = ""
+        # 三个独立筛选条件（各一个输入框）。原来只有一个「搜索」框，靠一段
+        # 跨字段模糊匹配同时管进程名 / IP / 端口 —— 想「只看 26900 这个口」
+        # 就只能在一长串里撞运气。拆开之后每个条件都能单独收紧、可以叠加。
+        self.f_proc = ""
+        self.f_ip = ""
+        self.f_port = ""
         self.group_mode = "region"       # region | app
         self.sort_col = None             # 点表头选中的排序列 key；None = 默认分组排序
         self.sort_desc = False
 
         self.show_resolved_var = tk.BooleanVar(value=False)
         self.auto_geo_var = tk.BooleanVar(value=True)
+        # 默认开启。本机开的服务（七日杀 26900、Web 服务、数据库…）全都只在
+        # 「监听」这一类里，关掉它就等于回到「端口明明活着却搜不到」。
+        self.show_listen_var = tk.BooleanVar(value=True)
+        # 这几个输入框的变量必须在 build_ui 之前建好：工具栏是 build_ui 里搭的，
+        # 变量留到那时再建，任何一次 early-return 都会让后续引用炸掉。
+        self.search_var = tk.StringVar()
+        self.f_proc_var = tk.StringVar()
+        self.f_ip_var = tk.StringVar()
+        self.f_port_var = tk.StringVar()
 
         self.setup_fonts()
         self.setup_window()
@@ -1138,62 +1158,95 @@ class App:
                                    font=self.fonts["small"], bg=C["bg"])
         self.btn_copy.pack(side="right", padx=(0, 8))
 
+    def _mk_filter_entry(self, parent, var, width=14):
+        """一个筛选输入框。改一个字就即时过滤，不必回车。"""
+        e = tk.Entry(parent, textvariable=var, font=self.fonts["small"], bd=0,
+                     highlightthickness=1, highlightbackground=C["border"],
+                     highlightcolor=C["accent"], bg=C["surface"],
+                     fg=C["text"], insertbackground=C["text"])
+        e.pack(side="left", ipady=4, ipadx=6)
+        e.configure(width=width)
+        var.trace_add("write", lambda *a: self.apply_filter())
+        return e
+
     def build_toolbar(self, parent):
+        # 三行：范围与开关 / 精确筛选 / 统计摘要。
+        # 高度写死（pack_propagate(False)），少给几像素最后一行就会被切掉半截。
         card = RoundedFrame(parent, radius=10, fill=C["surface"],
-                            outline=C["border"], height=104, bg=C["bg"])
+                            outline=C["border"], height=150, bg=C["bg"])
         card.pack(fill="x")
         card.pack_propagate(False)
         box = card.body
 
-        # 第一行：筛选
+        # 第一行：范围 + 开关
         r1 = tk.Frame(box, bg=C["surface"])
         r1.pack(fill="x", padx=14, pady=(10, 0))
 
         tk.Label(r1, text="范围", bg=C["surface"], fg=C["text_sub"],
                  font=self.fonts["small"]).pack(side="left", padx=(0, 8))
         self.kind_chips = []
-        for key, label in (("public", "仅公网连接"), ("lan", "含局域网")):
+        for key, label in (("public", "仅公网"), ("lan", "含局域网"),
+                           ("all", "含本机")):
             ch = Chip(r1, label, lambda k=key: self.set_kind(k), self.fonts,
-                      active=(key == "public"), bg=C["surface"])
+                      active=(key == self.filter_kind), bg=C["surface"])
             ch.pack(side="left", padx=(0, 6))
             ch.kind_key = key
             self.kind_chips.append(ch)
 
         tk.Frame(r1, bg=C["border"], width=1, height=18).pack(
             side="left", padx=10)
-        tk.Label(r1, text="搜索", bg=C["surface"], fg=C["text_sub"],
-                 font=self.fonts["small"]).pack(side="left", padx=(0, 6))
-        self.search_var = tk.StringVar()
-        self.entry = tk.Entry(r1, textvariable=self.search_var,
-                              font=self.fonts["small"], bd=0,
-                              highlightthickness=1, highlightbackground=C["border"],
-                              highlightcolor=C["accent"], bg=C["surface"],
-                              fg=C["text"], insertbackground=C["text"])
-        self.entry.pack(side="left", ipady=4, ipadx=6)
-        self.entry.configure(width=22)
-        self.search_var.trace_add("write", lambda *a: self.apply_filter())
+        # 这一项管的是「collect 阶段收不收」，不是事后过滤，所以改它必须重扫。
+        CheckBox(r1, "显示监听端口", self.show_listen_var, self.fonts,
+                 bg=C["surface"]).pack(side="left")
+        self.show_listen_var.trace_add("write", lambda *a: self.scan())
 
         CheckBox(r1, "只看已定位", self.show_resolved_var, self.fonts,
                  bg=C["surface"]).pack(side="left", padx=(14, 0))
         CheckBox(r1, "自动查地理位置", self.auto_geo_var, self.fonts,
                  bg=C["surface"]).pack(side="left", padx=(10, 0))
 
-        # 第二行：统计摘要
+        # 第二行：精确筛选。四个条件相互叠加（AND），每格留空 = 不设限。
         r2 = tk.Frame(box, bg=C["surface"])
-        r2.pack(fill="x", padx=14, pady=(8, 10))
-        self.stats_lbl = tk.Label(r2, text="准备扫描…", bg=C["surface"],
+        r2.pack(fill="x", padx=14, pady=(9, 0))
+
+        tk.Label(r2, text="进程", bg=C["surface"], fg=C["text_sub"],
+                 font=self.fonts["small"]).pack(side="left", padx=(0, 5))
+        self._mk_filter_entry(r2, self.f_proc_var, width=16)
+
+        tk.Label(r2, text="IP", bg=C["surface"], fg=C["text_sub"],
+                 font=self.fonts["small"]).pack(side="left", padx=(14, 5))
+        self._mk_filter_entry(r2, self.f_ip_var, width=18)
+
+        tk.Label(r2, text="端口", bg=C["surface"], fg=C["text_sub"],
+                 font=self.fonts["small"]).pack(side="left", padx=(14, 5))
+        self._mk_filter_entry(r2, self.f_port_var, width=9)
+
+        tk.Label(r2, text="关键词", bg=C["surface"], fg=C["text_sub"],
+                 font=self.fonts["small"]).pack(side="left", padx=(14, 5))
+        self.entry = self._mk_filter_entry(r2, self.search_var, width=15)
+
+        self.btn_clear_inline = tk.Label(r2, text="清除全部筛选", bg=C["surface"],
+                                        fg=C["accent"], font=self.fonts["small"],
+                                        cursor="hand2")
+        self.btn_clear_inline.pack(side="left", padx=(16, 0))
+        self.btn_clear_inline.bind("<Button-1>", lambda e: self.clear_filter())
+
+        # 第三行：统计摘要
+        r3 = tk.Frame(box, bg=C["surface"])
+        r3.pack(fill="x", padx=14, pady=(9, 10))
+        self.stats_lbl = tk.Label(r3, text="准备扫描…", bg=C["surface"],
                                   fg=C["text_sub"], font=self.fonts["small"])
         self.stats_lbl.pack(side="left")
-        self.geo_lbl = tk.Label(r2, text="", bg=C["surface"],
+        self.geo_lbl = tk.Label(r3, text="", bg=C["surface"],
                                 fg=C["text_muted"], font=self.fonts["small"])
         self.geo_lbl.pack(side="left", padx=(14, 0))
         # 本机代理状态。很多「地图上什么都看不到 / 只看到一堆 127.0.0.1」
         # 的情形，根子就在于流量全被本机代理接管了 —— 这一格必须显眼。
-        self.proxy_lbl = tk.Label(r2, text="", bg=C["surface"],
+        self.proxy_lbl = tk.Label(r3, text="", bg=C["surface"],
                                   fg=C["text_muted"], font=self.fonts["small"])
         self.proxy_lbl.pack(side="left", padx=(14, 0))
 
-        self.btn_geo = FlatButton(r2, "查询地理位置", self.run_geo,
+        self.btn_geo = FlatButton(r3, "查询地理位置", self.run_geo,
                                   btn_width=110, btn_height=28,
                                   font=self.fonts["tiny"], bg=C["surface"])
         self.btn_geo.pack(side="right")
@@ -1365,8 +1418,12 @@ class App:
         self.header = tk.Canvas(box, height=28, bg=C["surface_alt"],
                                 highlightthickness=0, bd=0)
         self.header.pack(fill="x", padx=14)
-        # 点表头排序。整条表头都可点（按 x 反查列），所以光标统一给手型。
+        # 点表头排序。整条表头都可点（按 x 反查列），所以光标统一给手型；
+        # 再叠一层悬停高亮，否则「表头能点」只靠光标形状很难被发现。
+        self._hover_col = None
         self.header.bind("<Button-1>", self._on_header_click)
+        self.header.bind("<Motion>", self._on_header_motion)
+        self.header.bind("<Leave>", self._on_header_leave)
         try:
             self.header.configure(cursor="hand2")
         except tk.TclError:      # 极少数主题不支持 hand2
@@ -1434,14 +1491,29 @@ class App:
     }
 
     def _draw_header(self):
-        """表头跟着横向滚动一起移动；点表头可按该列排序。"""
+        """表头跟着横向滚动一起移动；点表头可按该列排序。
+
+        当前排序列 = 强调色 + 箭头；鼠标悬停的列 = 一层淡底 + 深色字。
+        加悬停态是因为「表头能点排序」这件事光靠 hand2 光标几乎没人发现。
+        """
         self.header.delete("all")
         pad = 10
         x = pad
         tiny = _font_of(self.header, self.fonts["tiny"])
+        hover = getattr(self, "_hover_col", None)
         for text, key in self.COLS:
             active = (key == self.sort_col)
-            fill = C["accent"] if active else C["text_sub"]
+            w = self.widths[key]
+            if active or key == hover:
+                self.header.create_rectangle(
+                    x - 2, 2, x + w - 6, 26, outline="",
+                    fill=C["accent_soft"] if active else C["row_hover"])
+            if active:
+                fill = C["accent"]
+            elif key == hover:
+                fill = C["text"]
+            else:
+                fill = C["text_sub"]
             shown = text
             if active:
                 arrow = " ↓" if self.sort_desc else " ↑"
@@ -1449,29 +1521,45 @@ class App:
                 # 自身已占 161px，而这一列的宽度下限只有 168px ——
                 # 硬加箭头会压到下一列的标题上。列宽由数据量出、不为箭头让步，
                 # 放不下时只靠颜色标识，方向另有提示行兜底。
-                if tiny.measure(text) + tiny.measure(arrow) <= self.widths[key] - 6:
+                if tiny.measure(text) + tiny.measure(arrow) <= w - 6:
                     shown = text + arrow
             self.header.create_text(
                 x, 14, text=shown, anchor="w", fill=fill,
                 font=self.fonts["tiny"])
-            x += self.widths[key]
+            x += w
         self.header.configure(scrollregion=(0, 0, x, 28))
 
     # ------------------------------------------------------------ 点表头排序
 
-    def _on_header_click(self, event):
-        """按点击的 x 反查是哪一列。
+    def _col_at(self, x):
+        """按表头内的 x 反查是哪一列。
 
-        表头画布自己会横向滚动（跟随表体），所以必须用 canvasx 换算，
-        直接用 event.x 会在滚动后错位一整段。
+        传进来的 x 必须先过 canvasx 换算 —— 表头画布会跟着表体横向滚动，
+        直接用 event.x 会在滚动之后错位一整段。
         """
-        x = self.header.canvasx(event.x)
         cur = 10
         for _text, key in self.COLS:
             if cur <= x < cur + self.widths[key]:
-                self.cycle_sort(key)
-                return
+                return key
             cur += self.widths[key]
+        return None
+
+    def _on_header_click(self, event):
+        key = self._col_at(self.header.canvasx(event.x))
+        if key:
+            self.cycle_sort(key)
+
+    def _on_header_motion(self, event):
+        """悬停高亮当前列，让「表头可点」这件事看得见。"""
+        key = self._col_at(self.header.canvasx(event.x))
+        if key != getattr(self, "_hover_col", None):
+            self._hover_col = key
+            self._draw_header()
+
+    def _on_header_leave(self, _event=None):
+        if getattr(self, "_hover_col", None) is not None:
+            self._hover_col = None
+            self._draw_header()
 
     def cycle_sort(self, key):
         """点同一列循环：升序 → 降序 → 取消（回到默认的「国家 → 应用 → IP」）。
@@ -1498,17 +1586,17 @@ class App:
         geo = c.geo or {}
         has_geo = bool(geo.get("ok"))
         if key == "proc":
-            return (0, human_proc_name(c.proc_name).lower(), c.remote_ip)
+            return (0, human_proc_name(c.proc_name).lower(), c.display_ip)
         if key == "state":
             return (0, self._STATE_RANK.get(c.state, 9), c.state)
         if key == "ip":
-            return _ip_sort_key(c.remote_ip) + (c.remote_port,)
+            return _ip_sort_key(c.display_ip) + (c.display_port,)
         if key == "port":
-            return (0, c.remote_port, c.remote_ip)
+            return (0, c.display_port, c.display_ip)
         if key == "pid":
-            return (0, c.pid, c.remote_ip)
+            return (0, c.pid, c.display_ip)
         if key in ("province", "city", "district"):
-            return (0 if has_geo else 1, (geo.get(key) or ""), c.remote_ip)
+            return (0 if has_geo else 1, (geo.get(key) or ""), c.display_ip)
         if key == "coord":
             lat, lon = _to_float(geo.get("lat")), _to_float(geo.get("lon"))
             ok = has_geo and lat is not None and lon is not None
@@ -1516,8 +1604,10 @@ class App:
         if key == "net":
             return (0 if has_geo else 1,
                     (geoloc.short_network(geo) or "").lower() if has_geo else "",
-                    c.remote_ip)
-        return (0, c.remote_ip, c.remote_port)
+                    c.display_ip)
+        # 次值统一用 display_*：监听项的 remote_* 是空值，拿它当次键
+        # 会让同名的行排不出稳定顺序。
+        return (0, c.display_ip, c.display_port)
 
     def build_footer(self):
         foot = tk.Frame(self.root, bg=C["bg"])
@@ -1550,6 +1640,8 @@ class App:
     def scan(self):
         if self.worker is not None and self.worker.is_alive():
             return
+        # 开关值在主线程读定，工作线程只读这份快照
+        self.scan_listen = bool(self.show_listen_var.get())
         self.stop_flag = False
         self.conns = []
         self.filtered = []
@@ -1567,8 +1659,11 @@ class App:
     def _worker(self):
         try:
             self.scan_started = time.time()
-            kind = NET_PUBLIC if self.filter_kind == "public" else NET_LAN
-            conns = connscan.collect(min_kind=kind, include_listening=False)
+            # 范围三档：仅公网 / 含局域网（连带本机监听口）/ 全部（再加环回）
+            kind = {"public": NET_PUBLIC, "lan": NET_LAN,
+                    "all": NET_ANY}.get(self.filter_kind, NET_LAN)
+            conns = connscan.collect(min_kind=kind,
+                                     include_listening=self.scan_listen)
             # 顺带探一次本机代理。放在同一个工作线程里做，不额外开线程：
             # 只读注册表 + netstat + tasklist，约 0.3~0.5 秒，
             # 相比 collect() 自己的耗时（PowerShell 取进程路径那一步）可忽略。
@@ -1630,7 +1725,7 @@ class App:
         self.conns = conns
         self.last_error = ""
         n_apps = len({(c.proc_name, c.pid) for c in conns})
-        n_ips = len({c.remote_ip for c in conns})
+        n_ips = len({c.display_ip for c in conns})
         self.stats_lbl.configure(
             text=f"共 {len(conns)} 条连接　{n_apps} 个应用　{n_ips} 个服务器 IP"
                  f"　（{self.scan_cost:.1f} 秒）")
@@ -1753,8 +1848,13 @@ class App:
         self.update_summary()
 
     def clear_filter(self):
+        """清掉全部筛选条件。排序**不**一起清 —— 那是视图偏好不是筛选条件，
+        顺手复位会让人白点一次表头。"""
         self.filter_country = None
         self.search_var.set("")
+        self.f_proc_var.set("")
+        self.f_ip_var.set("")
+        self.f_port_var.set("")
         self.apply_filter()
         self.update_summary()
 
@@ -1762,6 +1862,10 @@ class App:
 
     def apply_filter(self):
         self.search_text = self.search_var.get().strip().lower()
+        self.f_proc = self.f_proc_var.get().strip().lower()
+        self.f_ip = self.f_ip_var.get().strip().lower()
+        self.f_port = self.f_port_var.get().strip()
+        port_want = self.f_port
         out = []
         for c in self.conns:
             geo = c.geo or {}
@@ -1770,10 +1874,35 @@ class App:
                     continue
             if self.show_resolved_var.get() and not geo.get("ok"):
                 continue
+            # 进程名：原始 exe 名与友好名都参与匹配（「七日杀」和
+            # 「7DaysToDie.exe」都该能搜到同一行）
+            if self.f_proc:
+                names = f"{c.proc_name} {human_proc_name(c.proc_name)}".lower()
+                if self.f_proc not in names:
+                    continue
+            # IP：远端与本地都要比。监听项、以及「本机服务器被本机客户端连」
+            # 的那条，目标地址落在环回上，只比 remote 会一条都命中不了。
+            if self.f_ip:
+                if (self.f_ip not in c.display_ip.lower()
+                        and self.f_ip not in (c.local_ip or "").lower()):
+                    continue
+            # 端口：纯数字按精确匹配（输入 443 不该把 8443 也捞出来），
+            # 输入里带非数字则退化成子串匹配，方便「一把端口一起看」。
+            if port_want:
+                if port_want.isdigit():
+                    if port_want not in {str(c.display_port),
+                                         str(c.local_port), str(c.remote_port)}:
+                        continue
+                else:
+                    ports = f"{c.display_port} {c.local_port} {c.remote_port}"
+                    if port_want not in ports:
+                        continue
             if self.search_text:
                 blob = " ".join([
                     c.proc_name, human_proc_name(c.proc_name),
                     str(c.pid), c.remote_ip, str(c.remote_port),
+                    c.local_ip, str(c.local_port), str(c.display_port),
+                    NET_LABEL.get(c.net_kind, ""),
                     geo.get("country", ""), geo.get("city", ""),
                     geo.get("datacenter", ""), geo.get("isp", ""),
                     geo.get("org", ""), c.service,
@@ -1798,8 +1927,8 @@ class App:
                 return (
                     geo.get("country") or "zzz",
                     human_proc_name(c.proc_name).lower(),
-                    c.remote_ip,
-                    c.remote_port,
+                    c.display_ip,
+                    c.display_port,
                 )
             out.sort(key=sort_key)
         self.filtered = out
@@ -1810,6 +1939,12 @@ class App:
         bits = []
         if self.filter_country:
             bits.append(f"已筛选：{self.filter_country}")
+        if self.f_proc:
+            bits.append(f"进程含「{self.f_proc_var.get().strip()}」")
+        if self.f_ip:
+            bits.append(f"IP 含「{self.f_ip_var.get().strip()}」")
+        if self.f_port:
+            bits.append(f"端口 {self.f_port_var.get().strip()}")
         if self.search_text:
             bits.append(f"搜索「{self.search_var.get().strip()}」")
         if self.sort_col:
@@ -1886,10 +2021,18 @@ class App:
         except tk.TclError:
             pass
         if not self.filtered:
-            self.empty_lbl.configure(
-                text="没有符合条件的连接。\n"
-                     "· 可能是当前没有程序在联外网\n"
-                     "· 或者筛选条件太严，试试「清除筛选」")
+            # 空表时给「为什么空」的定向提示，而不是一句通用的「没结果」。
+            # 「本机开了服务却搜不到端口」是最常见的一次，直接点出来。
+            tips = ["没有符合条件的连接。"]
+            if not self.scan_listen:
+                tips.append("· 本机开的服务（七日杀 26900 这类）只出现在「监听」里，"
+                            "请勾上「显示监听端口」后重扫")
+            if self.filter_kind == "public":
+                tips.append("· 当前范围是「仅公网」，想看本机 / 局域网换个范围试试")
+            if self.f_port.isdigit():
+                tips.append(f"· 端口筛选只认精确匹配（当前输入 {self.f_port}）")
+            tips.append("· 或者筛选条件太严，点「清除全部筛选」")
+            self.empty_lbl.configure(text="\n".join(tips))
             self.empty_lbl.pack(pady=40)
             return
 
@@ -1946,9 +2089,17 @@ class App:
             label=f"复制 PID　{c.pid}",
             command=lambda: self._copy_text(str(c.pid), "PID"))
         m.add_separator()
+        # 监听项没有远端，复制的该是「本机在哪个口上听」——
+        # 照抄 remote_hostport 会得到一串 `*:*`，粘出去毫无意义。
+        if c.is_listen_only:
+            where = f"{c.display_ip}:{c.display_port}"
+            addr_label = "复制本机监听地址"
+        else:
+            where = c.remote_hostport
+            addr_label = "复制远端地址"
         m.add_command(
-            label=f"复制远端地址　{c.remote_hostport}",
-            command=lambda: self._copy_text(c.remote_hostport, "远端地址"))
+            label=f"{addr_label}　{where}",
+            command=lambda: self._copy_text(where, "地址"))
 
         # 经纬度与地图：坐标只有公网 IP 查得到，本机/局域网连接没有，
         # 这里不隐藏而是置灰，免得用户以为菜单漏了项。
@@ -2355,6 +2506,11 @@ def _state_display(self) -> str:
     # FIN_WAIT_1/2、SYN_RECEIVED 都换成了无下划线那套）。这里必须覆盖全部
     # 取值：漏掉一个就会直接显示英文原文，而 state 列只有 58px 可用宽，
     # `FIN_WAIT1` 会被切成 `FIN_W` —— 看着像渲染坏了。
+    #
+    # 监听项额外带上协议：TCP 26900 和 UDP 26900 是两条独立的行，
+    # 状态都写「监听」的话它们在表里看起来完全一样，分不出哪个是哪个。
+    if self.is_listen_only:
+        return f"监听 {self.proto}"
     return {
         "ESTABLISHED": "已连接",
         "SYN_SENT": "连接中",

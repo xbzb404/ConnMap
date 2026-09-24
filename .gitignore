@@ -19,6 +19,8 @@ geo_cache.json
 _probe.py
 _probe_result.json
 _report_sample.txt
+# verify_exe.py 每次跑都会重写这个探针，别让它进仓库
+tools/probe.py
 
 # ---------- 编辑器 / 系统 ----------
 .vscode/

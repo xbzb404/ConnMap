@@ -33,7 +33,7 @@ from connscan import (
 
 APP_NAME = "本机连接地图"
 APP_SUBTITLE = "看每个应用连到了哪个国家 / 机房"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 AUTHOR = "by zhb"
 
 # ---------------------------------------------------------------- 设计 token
@@ -1205,15 +1205,32 @@ class App:
         self.apply_filter()
 
     def _mk_filter_entry(self, parent, var, width=14):
-        """一个筛选输入框。改一个字就过滤，连续输入会被合并（见 _queue_filter）。"""
+        """一个筛选输入框。
+
+        改值**不**立刻过滤：敲「26900」会触发五次重建，中间那四次毫无意义。
+        按回车、或点「筛选」按钮才真正应用（按钮上会带个「•」，
+        提示还有改动没应用 —— 免得改完忘了回车，看表格没动以为是没匹配到）。
+        """
         e = tk.Entry(parent, textvariable=var, font=self.fonts["small"], bd=0,
                      highlightthickness=1, highlightbackground=C["border"],
                      highlightcolor=C["accent"], bg=C["surface"],
                      fg=C["text"], insertbackground=C["text"])
         e.pack(side="left", ipady=4, ipadx=6)
         e.configure(width=width)
-        var.trace_add("write", self._queue_filter)
+        e.bind("<Return>", self._on_filter_enter)
+        e.bind("<KP_Enter>", self._on_filter_enter)   # 小键盘回车
+        var.trace_add("write", self._on_filter_edit)
         return e
+
+    def _on_filter_enter(self, _e=None):
+        self.apply_filter()
+        return "break"      # 吃掉默认行为，别在输入框里再插一个换行
+
+    def _on_filter_edit(self, *_a):
+        """输入框内容变了但还没应用：在按钮上留个记号。"""
+        btn = getattr(self, "btn_apply", None)
+        if btn is not None:
+            btn.set_text("筛选 •")
 
     def build_toolbar(self, parent):
         # 三行：范围与开关 / 精确筛选 / 统计摘要。
@@ -1272,6 +1289,12 @@ class App:
         tk.Label(r2, text="关键词", bg=C["surface"], fg=C["text_sub"],
                  font=self.fonts["small"]).pack(side="left", padx=(14, 5))
         self.entry = self._mk_filter_entry(r2, self.search_var, width=15)
+
+        # 应用筛选 = 手动触发。输入框改值只做记号，不重建表格。
+        self.btn_apply = FlatButton(r2, "筛选", self.apply_filter, primary=True,
+                                    btn_width=62, btn_height=26,
+                                    font=self.fonts["small"], bg=C["surface"])
+        self.btn_apply.pack(side="left", padx=(12, 0))
 
         self.btn_clear_inline = tk.Label(r2, text="清除全部筛选", bg=C["surface"],
                                         fg=C["accent"], font=self.fonts["small"],
@@ -2037,6 +2060,10 @@ class App:
         self.filtered = out
         self.render_rows()
         self.update_table_hint()
+        # 条件已应用，摘掉按钮上的「•」记号
+        btn = getattr(self, "btn_apply", None)
+        if btn is not None:
+            btn.set_text("筛选")
 
     def update_table_hint(self):
         bits = []

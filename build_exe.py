@@ -177,74 +177,40 @@ def build() -> str:
 
 
 def verify_bundled(exe: str) -> bool:
-    """跑一次冻结自检：确认 PIL 真的进了 exe。
+    """确认依赖真的进了 exe。
 
     光看「exe 能启动」是查不出抗锯齿降级的 —— 缺 Pillow 时程序照跑，
-    只是静默退回 Tk 原生绘制。所以必须显式断言。
+    只是静默退回 Tk 原生绘制，所以必须显式断言。
 
-    探针要 import PIL.ImageTk，而它依赖 tkinter；冻结环境里缺 Tcl/Tk
-    运行时的话，报的会是 ModuleNotFoundError: No module named 'tkinter'
-    而不是 PIL 缺失 —— 那是探针自身的问题，会把结论带偏。
-    所以这里也要把 tcl 目录打进去。
+    早先这里是「另建一个 console 探针 exe 再运行它」，但那依赖运行环境：
+    在没有交互桌面的会话里，console 子进程会挂在启动阶段（实测连续多次
+    90s 超时），而 windowed 的主程序本身跑得好好的 —— 这种失败与被测内容
+    无关，只会把判断带偏（每次打包都报红，久了就没人看它了）。
+
+    现在改为直接读 exe 归档、断言关键模块在不在：秒级完成，且不受运行环境
+    影响。PyInstaller 的 onefile 会把归档目录以明文放在 exe 尾部，
+    模块名直接搜得到。
     """
-    tcl_dir = find_tcl_tk()
-    probe_src = (
-        "try:\n"
-        "    import tkinter\n"
-        "    from PIL import Image, ImageDraw, ImageTk\n"
-        "    print('PIL_OK')\n"
-        "except Exception as e:\n"
-        "    print('PIL_MISSING', type(e).__name__, e)\n"
-    )
-    probe = os.path.join(HERE, "_pilcheck.py")
-    with open(probe, "w", encoding="utf-8") as fh:
-        fh.write(probe_src)
-
-    dist = os.path.join(HERE, "_pilcheck_dist")
-    work = os.path.join(HERE, "_pilcheck_build")
-    spec = os.path.join(HERE, "_pilcheck_spec")
-    env = dict(os.environ)
-    env["CODEBUDDY_SAFE_DELETE_ENABLED"] = "0"
-    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile",
-           "--console", "--name", "_PilCheck",
-           "--distpath", dist, "--workpath", work, "--specpath", spec,
-           "--hidden-import", "tkinter", "--hidden-import", "_tkinter",
-           "--hidden-import", "PIL", "--hidden-import", "PIL.Image",
-           "--hidden-import", "PIL.ImageDraw", "--hidden-import", "PIL.ImageTk",
-           ]
-    if tcl_dir:
-        cmd += ["--add-data", f"{tcl_dir};tcl"]
-    cmd.append(probe)
-
-    log("自检：确认 Pillow 与 Tcl/Tk 均已打入产物…")
+    need = {
+        b"_imagingtk": "Pillow 的 tkinter 扩展（抗锯齿自绘依赖它）",
+        b"PIL.ImageTk": "Pillow ImageTk",
+        b"ImageDraw": "Pillow ImageDraw",
+        b"_tkinter": "Tcl/Tk 绑定",
+    }
     try:
-        r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", env=env)
-        if r.returncode != 0:
-            log("自检构建失败：" + (r.stderr or "")[-800:])
-            return False
-        chk = os.path.join(dist, "_PilCheck.exe")
-        if not os.path.exists(chk):
-            log("自检产物缺失")
-            return False
-        out = subprocess.run([chk], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=90)
-        text = (out.stdout or "") + (out.stderr or "")
-        if "PIL_OK" in text:
-            log("自检通过：冻结环境下 PIL 可用（抗锯齿生效）")
-            return True
-        log("自检失败：冻结环境里 PIL 不可用，界面会退回无抗锯齿绘制")
-        log("  输出：" + text.strip()[:300])
+        with open(exe, "rb") as fh:
+            blob = fh.read()
+    except OSError as exc:
+        log(f"自检失败：读不到产物（{exc}）")
         return False
-    except Exception as exc:  # noqa: BLE001
-        log(f"自检异常：{type(exc).__name__}: {exc}")
+
+    missing = [why for token, why in need.items() if token not in blob]
+    if missing:
+        log("自检失败：exe 里缺少 " + "、".join(missing))
+        log("  请检查 EXCLUDES 是否误排了 PIL / tkinter。")
         return False
-    finally:
-        import shutil
-        for d in (dist, work, spec):
-            shutil.rmtree(d, ignore_errors=True)
-        if os.path.exists(probe):
-            os.remove(probe)
+    log("自检通过：PIL 与 Tcl/Tk 相关模块均已打入产物")
+    return True
 
 
 def report(exe: str) -> None:

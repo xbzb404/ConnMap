@@ -46,10 +46,11 @@ texts = [obj.header.itemcget(i, "text")
          for i in obj.header.find_all()
          if obj.header.type(i) == "text"]
 chk("表头含 PID", "PID" in texts, repr(texts))
-# 顺序：端口 之后、国家/地区 之前
+# 顺序：端口 之后、省 之前（表头早就没有「国家/地区」这一列了，
+# 这里曾经一直按旧列名断言，改列之后就常年报假失败）
 try:
     ip_i = texts.index("PID")
-    chk("PID 列位置正确", texts.index("端口") < ip_i < texts.index("国家/地区"))
+    chk("PID 列位置正确", texts.index("端口") < ip_i < texts.index("省"))
 except ValueError:
     chk("PID 列位置正确", False, repr(texts))
 
@@ -67,9 +68,13 @@ if conns:
     obj.render_rows()
     chk("渲染出行", len(obj.rows) == len(conns), f"{len(obj.rows)} 行")
     r = obj.rows[0]
-    chk("ConnRow 有 icon_lbl", hasattr(r, "icon_lbl"))
+    # 图标容器是常驻 Canvas（真图标与兜底色块共用），换行复用时 delete+重画
+    chk("ConnRow 有 icon_cv", hasattr(r, "icon_cv"))
     chk("ConnRow 有 on_context", r.on_context is not None)
-    chk("ConnRow 单元格数 = 8", len(r.cells) == 8, str(len(r.cells)))
+    # 直接对着真实的列定义断言，别再写死数字 ——
+    # 这里曾经写死 8，加经纬度/机房两列后就一直报假失败。
+    chk("ConnRow 单元格数 = 列数", len(r.cells) == len(obj.COLS),
+        f"{len(r.cells)} vs {len(obj.COLS)}")
     # PID 单元格显示的就是 pid
     chk("PID 单元格文本正确",
         r.cells[4].cget("text") == str(r.conn.pid),
@@ -117,6 +122,10 @@ try:
         pid = 4321
         remote_hostport = "1.2.3.4:443"
         proc_path = ""
+        geo = {}                  # show_row_menu 会读它拿经纬度
+        is_listen_only = False    # 非监听项 → 菜单走「复制远端地址」分支
+        display_ip = "1.2.3.4"
+        display_port = 443
 
     class FakeRow:
         conn = FakeConn()

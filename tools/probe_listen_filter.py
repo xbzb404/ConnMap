@@ -171,6 +171,17 @@ def part_a():
 def part_b(root, inst):
     print("\n===== B. 界面层（筛选 + 监听行显示） =====")
 
+    # 输入框现在带 120ms 防抖（见 App._queue_filter），探针改完变量立刻断言会读到
+    # 上一轮结果。这里把各变量的回调换成「立即过滤」—— 本段验的是筛选逻辑本身，
+    # 防抖只负责合并连续击键、不改变单次结果。
+    # ⚠ 不能只替换 inst._queue_filter：trace 注册的是当初那个绑定方法，
+    #   换掉实例属性对它毫无影响（踩过）。
+    for var in (inst.search_var, inst.f_proc_var, inst.f_ip_var,
+                inst.f_port_var, inst.show_resolved_var):
+        for mode, cb in var.trace_info():
+            var.trace_remove(mode, cb)
+        var.trace_add("write", lambda *a: inst.apply_filter())
+
     inst.conns = sample()
     inst.filter_country = None
     inst.show_resolved_var.set(False)

@@ -4,6 +4,9 @@
 曾经的 bug：兜底色块用 self.icon_lbl.winfo_x() 取位置，但那时还在
 __init__ 里、控件尚未布局，读回恒为 0 → 兜底行比真图标行左移 10px，
 同一列里两种图标错开，看起来就是「图标没对齐」。
+
+现在真图标与兜底色块**共用同一个 Canvas**（row.icon_cv），换行复用时
+只是 delete("all") 重画，所以两者天然同位；本脚本继续守着这条不变量。
 """
 import os
 import sys
@@ -46,8 +49,8 @@ n_real = n_fall = 0
 for row in obj.rows:
     path = (row.conn.proc_path or "").strip()
     has_real = bool(path) and winproc.extract_icon_rgba(path, row.ICON) is not None
-    px = int(row.icon_lbl.place_info().get("x"))
-    py = int(row.icon_lbl.place_info().get("y"))
+    px = int(row.icon_cv.place_info().get("x"))
+    py = int(row.icon_cv.place_info().get("y"))
     if has_real:
         real_x.add(px)
         real_y.add(py)
@@ -72,7 +75,7 @@ chk("所有行图标 y 一致", len(ally) == 1, f"出现 {sorted(ally)} 种 y")
 
 # 图标不能被压在文字下面：图标右缘 <= 文字起点
 bad = [r for r in obj.rows
-       if int(r.icon_lbl.place_info().get("x")) + r.ICON
+       if int(r.icon_cv.place_info().get("x")) + r.ICON
        > int(r.cells[0].place_info().get("x"))]
 chk("图标不与文字重叠", not bad, f"{len(bad)} 行重叠")
 

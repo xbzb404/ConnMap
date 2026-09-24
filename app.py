@@ -15,6 +15,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from tkinter import messagebox
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,7 @@ if HERE not in sys.path:
 
 import connscan
 import geoloc
+import localproxy
 import winproc
 from connscan import (
     Connection, NET_LABEL, NET_LAN, NET_LOCAL, NET_PUBLIC,
@@ -31,7 +33,7 @@ from connscan import (
 
 APP_NAME = "本机连接地图"
 APP_SUBTITLE = "看每个应用连到了哪个国家 / 机房"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 AUTHOR = "by zhb"
 
 # ---------------------------------------------------------------- 设计 token
@@ -804,7 +806,7 @@ class ConnRow:
              C["text"], "small", icon_end),
             (conn.scan_state_display(), widths["state"], "w",
              conn.scan_state_color(), "small", None),
-            # IP / 端口 / PID 用 8pt 等宽：9pt 下一整条 IPv4 要 165px，
+            # IP / 端口 / PID / 坐标 用 8pt 等宽：9pt 下一整条 IPv4 要 165px，
             # 全表宽度撑不住；降到 8pt 是 135px，正好放得下且不横向滚动。
             (conn.remote_ip, widths["ip"], "w", C["text"], "mono_sm", None),
             (str(conn.remote_port), widths["port"], "w",
@@ -817,18 +819,22 @@ class ConnRow:
              C["text_sub"], "small", None),
             (conn.scan_district_display(), widths["district"], "w",
              C["text_muted"], "small", None),
+            (conn.scan_coord_display(), widths["coord"], "w",
+             C["text_sub"], "mono_sm", None),
             (conn.scan_network_display(), widths["net"], "w",
              C["text_muted"], "small", None),
         ]
+        self._net_index = len(values) - 1
         for i, (text, w, anchor, fg, fkey, fixed_x) in enumerate(values):
             x = fixed_x if fixed_x is not None else cur
             # 单元格实际可用宽要和 place 时一致（w - 8），否则算出来的
             # 截断位置会比显示区多出 8px，末尾那截又变成硬切。
             cell_w = max(20, w - 8)
             # 尾列（运营商/机房）数据源是外部字符串，长度不可控。
-            # 用 fit_net_text 按像素截，并**优先保住末尾的 [CDN]/[云机房] 标签** ——
-            # 那才是这列真正有信息量的部分，不能被名字挤掉。
-            if i == len(values) - 1:
+            # 正常路径下列宽已按真实最长值量过（_measure_net_width），
+            # 这里只是最后一道兜底：真要长到超过 NET_MAX_W 上限时才补省略号，
+            # 并按 fit_net_text 的规则**优先保住末尾的 [CDN]/[云机房] 标签**。
+            if i == self._net_index:
                 text = fit_net_text(text, _font_of(self.frame, fonts[fkey]),
                                     cell_w, "…")
             lbl = tk.Label(self.frame, text=text, anchor=anchor,
@@ -839,6 +845,10 @@ class ConnRow:
             # 每列都按该列的标称宽度前进，和表头严格对齐
             cur += (proc_w if i == 0 else w)
             self.cells.append(lbl)
+
+        # refresh_geo 要在增量刷新时复用同一套列宽去截断，
+        # 所以把 widths 存下来（它是 App 的同一个 dict，改宽后会一起变）。
+        self.widths = widths
 
         self._apply_icon()
 
@@ -946,7 +956,8 @@ class ConnRow:
         """地理结果到达后，只更新受影响的单元格文字。
 
         不重建整行——重建会让表格重排、正在看的位置跳走。
-        单元格下标：0 进程 1 状态 2 IP 3 端口 4 PID 5 省 6 市 7 区 8 运营商
+        单元格下标：0 进程 1 状态 2 IP 3 端口 4 PID
+                   5 省 6 市 7 区 8 经纬度 9 运营商/机房
         """
         geo = self.conn.geo or {}
         country = geo.get("country") or ""
@@ -956,10 +967,41 @@ class ConnRow:
         self.cells[5].configure(text=geo.get("province") or "—")
         self.cells[6].configure(text=self.conn.scan_city_display())
         self.cells[7].configure(text=self.conn.scan_district_display())
-        self.cells[8].configure(text=self.conn.scan_network_display())
+        self.cells[8].configure(text=self.conn.scan_coord_display())
+        # 增量刷新时列宽可能还是上一轮的（收尾会重排一次并自动量宽），
+        # 所以这一格照样走一次截断，避免中途把文字画到格子外面去。
+        self.cells[9].configure(
+            text=fit_net_text(
+                self.conn.scan_network_display(),
+                _font_of(self.frame, self.fonts["small"]),
+                max(20, self.widths["net"] - 8), "…"))
 
 
 # ---------------------------------------------------------------- 主程序
+
+
+def _ip_sort_key(ip: str):
+    """IP 按**数值**序排，不是字典序。
+
+    字典序会把 `10.0.0.2` 排在 `9.1.1.1` 前面（'1' < '9'），
+    而人看 IP 是按段比大小的。返回 (缺失标志, 四段整数组)，
+    第二项类型与下面的 (0, (0,0,0,0)) 保持一致才能比较。
+    """
+    if ip and ip.count(".") == 3:
+        try:
+            return (0, tuple(int(p) for p in ip.split(".")))
+        except ValueError:
+            pass
+    # IPv6 与异常值不参与数值比较，统一沉到底部
+    return (1, (0, 0, 0, 0))
+
+
+def _to_float(value):
+    """宽松取浮点：None / 空串 / 非数字一律当「没有」。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class App:
@@ -976,10 +1018,13 @@ class App:
         self.scan_started = 0.0
         self.scan_cost = 0.0
         self.last_error = ""
+        self.proxy_info = None           # localproxy.ProxyInfo，工作线程里探测
         self.filter_kind = "public"      # public | lan
         self.filter_country = None       # None = 全部
         self.search_text = ""
         self.group_mode = "region"       # region | app
+        self.sort_col = None             # 点表头选中的排序列 key；None = 默认分组排序
+        self.sort_desc = False
 
         self.show_resolved_var = tk.BooleanVar(value=False)
         self.auto_geo_var = tk.BooleanVar(value=True)
@@ -1021,7 +1066,10 @@ class App:
     def setup_window(self):
         self.root.title(f"{APP_NAME} · ConnMap")
         self.root.configure(bg=C["bg"])
-        w, h = 1360, 860
+        # 表格要同时装下「经纬度」和「运营商/机房全称」两列，比原来宽不少。
+        # 默认给 1600，并按屏幕尺寸收敛：小屏自动缩到可用宽度，
+        # 剩下的靠横向滚动条补（表头与表体已同步滚动）。
+        w, h = 1600, 900
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         w = min(w, max(1080, sw - 60))
@@ -1139,6 +1187,11 @@ class App:
         self.geo_lbl = tk.Label(r2, text="", bg=C["surface"],
                                 fg=C["text_muted"], font=self.fonts["small"])
         self.geo_lbl.pack(side="left", padx=(14, 0))
+        # 本机代理状态。很多「地图上什么都看不到 / 只看到一堆 127.0.0.1」
+        # 的情形，根子就在于流量全被本机代理接管了 —— 这一格必须显眼。
+        self.proxy_lbl = tk.Label(r2, text="", bg=C["surface"],
+                                  fg=C["text_muted"], font=self.fonts["small"])
+        self.proxy_lbl.pack(side="left", padx=(14, 0))
 
         self.btn_geo = FlatButton(r2, "查询地理位置", self.run_geo,
                                   btn_width=110, btn_height=28,
@@ -1270,35 +1323,54 @@ class App:
         # 样本也要从**真实数据源**取：别名表、地名映射表、状态映射表，
         # 不要手编「看着挺长」的字符串（会白占宽度、挤掉别的列）。
         #
-        # 1360 窗口下表格可视区实测 950px。需求如下（px）：
+        # 1600 窗口下表格可视区实测 1190px。需求如下（px）：
         #   proc  图标 16 + 间距 6 + 最长别名「Google Chrome 浏览器」194
         #   state 「已连接/连接中/握手中」54（原始状态已被 collect 过滤或映射）
         #   ip    等宽 8pt 下最长 IP 135（9pt 要 165，装不下）
         #   pid   等宽 8pt 下 4294967295 = 90
         #   port  等宽 8pt 下 65535 = 45
         #   place 地名映射表最长「加利福尼亚 / 阿姆斯特丹」90
-        #   net   外部字符串，长度不可控。用户定的是「标签优先、名字压短」，
-        #         但太窄会让名字只剩一两个字（`H…　[云机房]`）等于没显示，
-        #         所以给到 168（单元格 160）—— 名字能留 5~7 个字符：
-        #         `Micros…　[云机房]`。代价是整表 989px > 可视 950px，
-        #         最右侧要拖横向滚动条（滚动条与表头同步的逻辑本来就已就位）。
-        #         这是用户明确选的取舍：宁可滚动，也要看清名字+标签。
-        # 所以 ip/pid/port 三列用 mono_sm(8pt)，其余 9pt。
+        # 十列合计仍会超过 1190 —— 这是刻意的：宁可拖横向滚动条，
+        # 也不把「经纬度」和「运营商/机房全称」压成看不懂的样子。
         # 省/市/区 三列要装得下「规范化后」的真实最长值：
         #   省 → 不列颠哥伦比亚（126px，加拿大卑诗省 IP 真会返回）
         #   市 → 阿姆斯特丹（90px，荷兰 IP 真会返回）
         #   区 → 乌鲁木齐（72px，国内经 PConline 补齐的区县）
         # 故 province=138 / city=104 / district=84（各留 ~4~6px 余量）。
-        # 整表 1105 + 10 = 1115px，超出 950px 可视区 → 需横向滚动（用户已确认可接受）。
+        #
+        # coord 列放 4 位小数的「纬度, 经度」（`31.2304, 121.4740`）。
+        # 4 位小数约 11 米精度，足够指到机房所在的楼。
+        # 宽度不手估 —— 按**最坏情况**的真实像素宽量：
+        # 纬度最大 -89.9999（8 字符）、经度最大 -179.9999（9 字符），
+        # 加中间的「, 」共 19 个等宽字符。少留 8px 就会被硬切掉尾巴
+        # （实测踩过：`26.5982, 106` 后面那截没了，而且没有省略号提示）。
+        #
+        # 所以 coord 的宽度**由字体实测得到**，不在常量表里写死。
+        #
+        # net 列（运营商/机房）**不再靠截断省地方**：它的值来自外部字符串，
+        # 长度不可控，固定宽度必然要砍掉一半名字（用户明确要求显示全称）。
+        # 改为每轮渲染前按**真实最长值**量一次（`_measure_net_width`），
+        # 名字全称铺得下就铺，铺不下就让整表变宽、拖横向滚动条。
+        # 这里的 168 只是「还没量出来时」的初始值。
         self.widths = {
             "proc": 234, "state": 66, "ip": 152, "port": 57,
-            "pid": 102, "province": 138, "city": 104, "district": 84, "net": 168,
+            "pid": 102, "province": 138, "city": 104, "district": 84,
+            "coord": 122, "net": 168,
         }
+        _mono8 = _font_of(self.root, self.fonts["mono_sm"])
+        self.widths["coord"] = max(
+            self.widths["coord"], _mono8.measure("-89.9999, -179.9999") + 14)
         self.table_w = sum(self.widths.values()) + 10
 
         self.header = tk.Canvas(box, height=28, bg=C["surface_alt"],
                                 highlightthickness=0, bd=0)
         self.header.pack(fill="x", padx=14)
+        # 点表头排序。整条表头都可点（按 x 反查列），所以光标统一给手型。
+        self.header.bind("<Button-1>", self._on_header_click)
+        try:
+            self.header.configure(cursor="hand2")
+        except tk.TclError:      # 极少数主题不支持 hand2
+            pass
         self._draw_header()
         # 滚动区：横向 + 纵向都要能滚，列宽合计可能超过可见宽度
         cvwrap = tk.Frame(box, bg=C["surface"])
@@ -1341,23 +1413,111 @@ class App:
         except (AttributeError, tk.TclError):
             pass
 
+    # 列定义：表头绘制、点表头反查列、单元格取值三处共用一份，
+    # 顺序必须和 ConnRow.values 严格一致 —— 两边靠同一份 widths 累加定位，
+    # 顺序错一处，往右的列会整体错列。
+    COLS = [
+        ("应用 / 进程", "proc"), ("状态", "state"), ("服务器 IP", "ip"),
+        ("端口", "port"), ("PID", "pid"),
+        ("省", "province"), ("市", "city"), ("区", "district"),
+        ("经纬度", "coord"), ("运营商 / 机房（全称）", "net"),
+    ]
+    COL_LABEL = {key: text for text, key in COLS}
+
+    # 状态点击排序时的语义序：把用户最关心的「已连接」推在最前，
+    # 而不是按中文 Unicode 码位排（那样「UDP」会跑到「已连接」前面）。
+    _STATE_RANK = {
+        "ESTABLISHED": 0, "SYN_SENT": 1, "SYN_RECV": 1,
+        "LISTENING": 2, "UDP": 3,
+        "CLOSE_WAIT": 4, "TIME_WAIT": 4, "FIN_WAIT1": 4, "FIN_WAIT2": 4,
+        "LAST_ACK": 4, "CLOSING": 4, "DELETE_TCB": 4, "CLOSED": 5,
+    }
+
     def _draw_header(self):
-        """表头跟着横向滚动一起移动。"""
+        """表头跟着横向滚动一起移动；点表头可按该列排序。"""
         self.header.delete("all")
-        cols = [
-            ("应用 / 进程", "proc"), ("状态", "state"), ("服务器 IP", "ip"),
-            ("端口", "port"), ("PID", "pid"),
-            ("省", "province"), ("市", "city"), ("区", "district"),
-            ("运营商/机房", "net"),
-        ]
         pad = 10
         x = pad
-        for text, key in cols:
+        tiny = _font_of(self.header, self.fonts["tiny"])
+        for text, key in self.COLS:
+            active = (key == self.sort_col)
+            fill = C["accent"] if active else C["text_sub"]
+            shown = text
+            if active:
+                arrow = " ↓" if self.sort_desc else " ↑"
+                # 箭头是「放得下才画」：150% 缩放下「运营商 / 机房（全称）」
+                # 自身已占 161px，而这一列的宽度下限只有 168px ——
+                # 硬加箭头会压到下一列的标题上。列宽由数据量出、不为箭头让步，
+                # 放不下时只靠颜色标识，方向另有提示行兜底。
+                if tiny.measure(text) + tiny.measure(arrow) <= self.widths[key] - 6:
+                    shown = text + arrow
             self.header.create_text(
-                x, 14, text=text, anchor="w", fill=C["text_sub"],
+                x, 14, text=shown, anchor="w", fill=fill,
                 font=self.fonts["tiny"])
             x += self.widths[key]
         self.header.configure(scrollregion=(0, 0, x, 28))
+
+    # ------------------------------------------------------------ 点表头排序
+
+    def _on_header_click(self, event):
+        """按点击的 x 反查是哪一列。
+
+        表头画布自己会横向滚动（跟随表体），所以必须用 canvasx 换算，
+        直接用 event.x 会在滚动后错位一整段。
+        """
+        x = self.header.canvasx(event.x)
+        cur = 10
+        for _text, key in self.COLS:
+            if cur <= x < cur + self.widths[key]:
+                self.cycle_sort(key)
+                return
+            cur += self.widths[key]
+
+    def cycle_sort(self, key):
+        """点同一列循环：升序 → 降序 → 取消（回到默认的「国家 → 应用 → IP」）。
+
+        留一个「取消」档是有用的：默认排序按国家分组，同类连接靠在一起，
+        而纯按某一列排会把同国家/同应用的行打散，取消档能一键回到分组视图。
+        """
+        if self.sort_col != key:
+            self.sort_col, self.sort_desc = key, False
+        elif not self.sort_desc:
+            self.sort_desc = True
+        else:
+            self.sort_col, self.sort_desc = None, False
+        self._draw_header()
+        self.apply_filter()
+
+    def _sort_value(self, c, key):
+        """把一条连接折成可比较的 (缺失标志, 主值, 次值)。
+
+        缺失标志的目的：让「还没查到地理信息」的行始终沉底，
+        而不是一升序就顶在最前面。真正的「沉底」由 apply_filter 里
+        的两趟稳定排序完成（先按值排、再按标志排），这样正序倒序都成立。
+        """
+        geo = c.geo or {}
+        has_geo = bool(geo.get("ok"))
+        if key == "proc":
+            return (0, human_proc_name(c.proc_name).lower(), c.remote_ip)
+        if key == "state":
+            return (0, self._STATE_RANK.get(c.state, 9), c.state)
+        if key == "ip":
+            return _ip_sort_key(c.remote_ip) + (c.remote_port,)
+        if key == "port":
+            return (0, c.remote_port, c.remote_ip)
+        if key == "pid":
+            return (0, c.pid, c.remote_ip)
+        if key in ("province", "city", "district"):
+            return (0 if has_geo else 1, (geo.get(key) or ""), c.remote_ip)
+        if key == "coord":
+            lat, lon = _to_float(geo.get("lat")), _to_float(geo.get("lon"))
+            ok = has_geo and lat is not None and lon is not None
+            return (0 if ok else 1, lat if ok else 0.0, lon if ok else 0.0)
+        if key == "net":
+            return (0 if has_geo else 1,
+                    (geoloc.short_network(geo) or "").lower() if has_geo else "",
+                    c.remote_ip)
+        return (0, c.remote_ip, c.remote_port)
 
     def build_footer(self):
         foot = tk.Frame(self.root, bg=C["bg"])
@@ -1409,8 +1569,16 @@ class App:
             self.scan_started = time.time()
             kind = NET_PUBLIC if self.filter_kind == "public" else NET_LAN
             conns = connscan.collect(min_kind=kind, include_listening=False)
+            # 顺带探一次本机代理。放在同一个工作线程里做，不额外开线程：
+            # 只读注册表 + netstat + tasklist，约 0.3~0.5 秒，
+            # 相比 collect() 自己的耗时（PowerShell 取进程路径那一步）可忽略。
+            proxy = None
+            try:
+                proxy = localproxy.detect()
+            except Exception:  # noqa: BLE001
+                proxy = None
             self.scan_cost = time.time() - self.scan_started
-            self.post("scan_done", conns)
+            self.post("scan_done", (conns, proxy))
         except Exception as exc:  # noqa: BLE001
             self.post("scan_failed", f"{type(exc).__name__}: {exc}")
 
@@ -1420,7 +1588,45 @@ class App:
         self.status_lbl.configure(text=f"扫描失败：{msg}")
         self.stats_lbl.configure(text="扫描失败")
 
-    def _scan_done(self, conns):
+    def _render_proxy(self):
+        """把本机代理状态写到工具栏那一格。"""
+        lbl = getattr(self, "proxy_lbl", None)
+        if lbl is None:
+            return
+        pi = self.proxy_info
+        if pi is None:
+            lbl.configure(text="本机代理：检测不可用", fg=C["text_muted"])
+            return
+        if pi.conflict:
+            # 两块注册表不一致是最值得报警的一种：设置界面说开了、浏览器却在直连。
+            lbl.configure(
+                text=f"本机代理：{localproxy.describe(pi, short=True)}"
+                     f"　⚠ {pi.conflict_text}",
+                fg=C["warn"])
+            return
+        if not pi.enabled:
+            lbl.configure(text=f"本机代理：{localproxy.describe(pi, short=True)}",
+                          fg=C["text_muted"])
+            return
+        who = f"（{pi.who}）" if pi.who else ""
+        if pi.source == "process":
+            text = f"本机代理：{pi.endpoint or '端口未知'}{who}　系统代理未启用"
+        else:
+            text = f"本机代理：{pi.endpoint}{who}"
+        # 配了代理但端口没在听 = 代理软件挂了，系统设置还留着 → 警告色
+        warn = bool(pi.port and not pi.listening and pi.source != "process")
+        if warn:
+            text += "　⚠ 端口未监听"
+        lbl.configure(text=text, fg=(C["warn"] if warn else C["ok"]))
+
+    def _scan_done(self, payload):
+        # 兼容两种载荷：老签名直接传 conns，新签名传 (conns, proxy)
+        if isinstance(payload, tuple) and len(payload) == 2:
+            conns, proxy = payload
+        else:
+            conns, proxy = payload, None
+        self.proxy_info = proxy
+        self._render_proxy()
         self.conns = conns
         self.last_error = ""
         n_apps = len({(c.proc_name, c.pid) for c in conns})
@@ -1576,16 +1782,26 @@ class App:
                     continue
             out.append(c)
 
-        # 排序：先按国家，再按应用，最后按 IP，让同类靠在一起
-        def sort_key(c):
-            geo = c.geo or {}
-            return (
-                geo.get("country") or "zzz",
-                human_proc_name(c.proc_name).lower(),
-                c.remote_ip,
-                c.remote_port,
-            )
-        out.sort(key=sort_key)
+        # 排序：点过表头就按那一列；没点过则按「国家 → 应用 → IP」分组，
+        # 让同类连接靠在一起。
+        if self.sort_col:
+            key = self.sort_col
+            out.sort(key=lambda c: self._sort_value(c, key)[1:],
+                     reverse=self.sort_desc)
+            # 第二趟稳定排序：把「还没有该字段值」的行压到底部。
+            # 两趟都必须做 —— reverse 会连缺失标志一起翻过去，
+            # 单靠一趟的话一降序，空值就全飘到最上面了。
+            out.sort(key=lambda c: self._sort_value(c, key)[0])
+        else:
+            def sort_key(c):
+                geo = c.geo or {}
+                return (
+                    geo.get("country") or "zzz",
+                    human_proc_name(c.proc_name).lower(),
+                    c.remote_ip,
+                    c.remote_port,
+                )
+            out.sort(key=sort_key)
         self.filtered = out
         self.render_rows()
         self.update_table_hint()
@@ -1596,6 +1812,12 @@ class App:
             bits.append(f"已筛选：{self.filter_country}")
         if self.search_text:
             bits.append(f"搜索「{self.search_var.get().strip()}」")
+        if self.sort_col:
+            bits.append(f"按「{self.COL_LABEL[self.sort_col]}」"
+                        f"{'降序' if self.sort_desc else '升序'}")
+        else:
+            # 常驻一句可点提示 —— 光看表头没有箭头，功能不容易被发现
+            bits.append("点表头可排序")
         bits.append(f"{len(self.filtered)} / {len(self.conns)} 条")
         if self.last_error:
             bits.append(f"错误：{self.last_error}")
@@ -1606,6 +1828,54 @@ class App:
             r.destroy()
         self.rows = []
         self.empty_lbl.pack_forget()
+
+    # 尾列宽度的兜底区间。下限保证「查询中…」这类短值不把列压成一条缝；
+    # 上限 620px 是经验值：实测最长的组织名（约 456px，
+    # 「Tencent Cloud Computing (Beijing) Co., Ltd　[云机房]」）能全放下，
+    # 再长就真没有铺开的意义了——那时由 fit_net_text 补省略号保住末尾标签。
+    NET_MIN_W = 168
+    NET_MAX_W = 620
+
+    def _measure_net_width(self) -> int:
+        """按本轮真实数据量出「运营商 / 机房」列要多宽。
+
+        这一列的值来自外部（ISP / 云厂商的组织名），长度完全不可控：
+        短的「Chinanet」只有 8 个字符，长的
+        「Shenzhen Tencent Computer Systems Company Limited」近 300px。
+        固定列宽只能靠截断，而截断掉的恰好是名字最具体的部分 ——
+        用户要的是**全称**，那就把列宽交给数据本身决定：
+        取「最长那条的真实像素宽 + 内边距」，封顶 NET_MAX_W（再长就真铺不下了，
+        那时由 fit_net_text 兜底补省略号，并优先保住末尾的 [CDN] 标签）。
+
+        「查询中…」「未定位（…）」这类占位文字不参与量宽 ——
+        它们不是最终值，拿它们定宽会让表格先胖一圈再瘦回去。
+        """
+        font = _font_of(self.header, self.fonts["small"])
+        widest = 0
+        for c in self.filtered:
+            text = c.scan_network_display()
+            if not text or text == "—" or text.startswith("未定位"):
+                continue
+            widest = max(widest, font.measure(text))
+        return max(self.NET_MIN_W, min(self.NET_MAX_W, widest + 14))
+
+    def _sync_table_width(self, redraw_header: bool = True):
+        """列宽变了之后，把「整表宽」与表头/画布窗口一起同步。
+
+        漏掉任何一步都会错位：表头不同步 → 表头与表体列错开；
+        画布窗口不同步 → 横向滚动条长度还是按旧宽度算的。
+        """
+        self.table_w = sum(self.widths.values()) + 10
+        if redraw_header:
+            self._draw_header()
+        try:
+            self.canvas.itemconfigure(
+                self._rows_win,
+                width=max(self.canvas.winfo_width() or 0, self.table_w))
+            self.canvas.configure(
+                scrollregion=self.canvas.bbox("all") or (0, 0, self.table_w, 0))
+        except tk.TclError:
+            pass
 
     def render_rows(self):
         self.clear_rows()
@@ -1622,6 +1892,13 @@ class App:
                      "· 或者筛选条件太严，试试「清除筛选」")
             self.empty_lbl.pack(pady=40)
             return
+
+        # 先把尾列宽度按这一轮的数据量好，再铺行 ——
+        # 顺序反过来（先铺行后改宽）就得重铺一遍，白白多花几百毫秒。
+        want = self._measure_net_width()
+        if want != self.widths["net"]:
+            self.widths["net"] = want
+            self._sync_table_width()
 
         # 按国家分组的序号，保证同国家颜色一致
         country_index = {}
@@ -1640,8 +1917,9 @@ class App:
     # ------------------------------------------------------- 右键菜单
 
     def show_row_menu(self, row, event):
-        """右键菜单：打开程序所在位置 / 复制路径 / 复制 PID。"""
+        """右键菜单：打开程序所在位置 / 复制路径 / 复制 PID / 经纬度与地图。"""
         c = row.conn
+        geo = c.geo or {}
         path = (c.proc_path or "").strip()
         m = tk.Menu(self.root, tearoff=0)
         if path:
@@ -1672,10 +1950,58 @@ class App:
             label=f"复制远端地址　{c.remote_hostport}",
             command=lambda: self._copy_text(c.remote_hostport, "远端地址"))
 
+        # 经纬度与地图：坐标只有公网 IP 查得到，本机/局域网连接没有，
+        # 这里不隐藏而是置灰，免得用户以为菜单漏了项。
+        m.add_separator()
+        if geoloc.has_coords(geo):
+            coords = geoloc.coords_pair(geo)
+            m.add_command(
+                label=f"复制经纬度　{coords}",
+                command=lambda: self._copy_text(coords, "经纬度"))
+            m.add_command(
+                label=f"复制完整地址　{geoloc.describe_location(geo)}",
+                command=lambda: self._copy_text(
+                    self._full_address(c), "完整地址"))
+            m.add_command(
+                label="在地图上查看机房位置",
+                command=lambda: self._open_map(c))
+        else:
+            m.add_command(label="复制经纬度（该 IP 暂无坐标）", state="disabled")
+            m.add_command(label="在地图上查看（该 IP 暂无坐标）", state="disabled")
+
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
             m.grab_release()
+
+    @staticmethod
+    def _full_address(conn) -> str:
+        """一行完整地址：省市区 + 坐标 + 运营商，用于复制给别人。"""
+        geo = conn.geo or {}
+        parts = [geoloc.describe_location(geo)]
+        coords = geoloc.describe_coords(geo)
+        if coords:
+            parts.append(coords)
+        net = geoloc.short_network(geo)
+        if net:
+            parts.append(net)
+        ip = conn.remote_ip
+        return f"{ip}　" + "　".join(p for p in parts if p)
+
+    def _open_map(self, conn):
+        """用高德地图打点打开该 IP 的机房位置。"""
+        geo = conn.geo or {}
+        url = geoloc.map_url(geo)
+        if not url:
+            self.status_lbl.configure(text="该 IP 暂无经纬度，无法定位到地图")
+            return
+        try:
+            webbrowser.open(url)
+            self.status_lbl.configure(
+                text=f"已在地图中打开：{geoloc.describe_coords(geo)}　"
+                     f"（{geoloc.describe_location(geo)}）")
+        except Exception as exc:  # noqa: BLE001
+            self.status_lbl.configure(text=f"打开地图失败：{exc}")
 
     def _reveal_path(self, path):
         ok = winproc.reveal_in_explorer(path)
@@ -1709,9 +2035,12 @@ class App:
         c = row.conn
         geo = c.geo or {}
         if geo.get("ok"):
+            coords = geoloc.describe_coords(geo)
+            tail = f"　{coords}" if coords else ""
             self.status_lbl.configure(
                 text=f"{human_proc_name(c.proc_name)} → {c.remote_hostport}　"
-                     f"{geoloc.describe_region(geo)}　{geoloc.describe_network(geo)}")
+                     f"{geoloc.describe_region(geo)}{tail}　"
+                     f"{geoloc.describe_network(geo)}")
         else:
             self.status_lbl.configure(
                 text=f"{human_proc_name(c.proc_name)} → {c.remote_hostport}"
@@ -1895,6 +2224,19 @@ class App:
                 lines.append(f"      机房：{'、'.join(nets[:4])}")
         lines.append("")
 
+        # 本机代理：很多「地图上什么都看不到」的情形，根子在这里
+        lines.append("【本机代理】")
+        if self.proxy_info is None:
+            lines.append("  未检测")
+        else:
+            for line in localproxy.summary_lines(self.proxy_info):
+                lines.append("  " + line.lstrip("· ").strip())
+            pi = self.proxy_info
+            if pi.enabled and pi.source != "process":
+                lines.append("  说明：经系统代理出网的流量，其真实出口由代理节点决定，"
+                             "本表看到的是代理软件与节点之间的连接。")
+        lines.append("")
+
         # 按应用汇总
         lines.append("【应用分布】")
         by_app = {}
@@ -1912,17 +2254,22 @@ class App:
 
         # 明细
         lines.append("【连接明细】")
-        lines.append(f"{'应用':<22}{'服务器':<24}{'地区':<18}{'运营商/机房':<34}")
-        lines.append("-" * 100)
+        lines.append(f"{'应用':<22}{'服务器':<24}{'地区':<18}"
+                     f"{'经纬度':<20}{'运营商/机房'}")
+        lines.append("-" * 130)
         for c in sorted(conns, key=lambda x: (
                 (x.geo or {}).get("country") or "zzz",
                 human_proc_name(x.proc_name))):
             geo = c.geo or {}
+            # 末列不截断：这一列要的就是全称（本机/局域网连接没有地理信息，
+            # 用「—」占位，与「查不到」区分开）。
+            net = geoloc.short_network(geo) or "—"
             lines.append(
                 f"{human_proc_name(c.proc_name)[:20]:<22}"
                 f"{c.remote_hostport[:22]:<24}"
                 f"{geoloc.describe_location(geo)[:16]:<18}"
-                f"{geoloc.short_network(geo)[:32]:<34}")
+                f"{(geoloc.coords_pair(geo) or '—'):<20}"
+                f"{net}")
         lines.append("")
         lines.append(f"— {APP_NAME} v{APP_VERSION} {AUTHOR}")
         return "\n".join(lines)
@@ -1988,17 +2335,39 @@ class App:
 # 这些是给 Connection 加展示方法，避免在界面层散落格式化逻辑。
 
 
+def _geolocatable(conn) -> bool:
+    """这条连接的目标 IP 会不会去查地理位置。
+
+    只有公网 IP 才会 —— 本机（127.0.0.1）、局域网（192.168./10.）、组播
+    都不在查询范围里（免费库也查不到）。展示层据此把占位文字分开：
+    会查的写「查询中…」，不会查的直接写「—」。
+    """
+    return conn.net_kind == NET_PUBLIC
+
+
 def _proc_display(self) -> str:
     name = human_proc_name(self.proc_name)
     return f"{name}"
 
 
 def _state_display(self) -> str:
+    # 状态值已经在 connscan.normalize_state() 里归一化过（Windows 的
+    # FIN_WAIT_1/2、SYN_RECEIVED 都换成了无下划线那套）。这里必须覆盖全部
+    # 取值：漏掉一个就会直接显示英文原文，而 state 列只有 58px 可用宽，
+    # `FIN_WAIT1` 会被切成 `FIN_W` —— 看着像渲染坏了。
     return {
         "ESTABLISHED": "已连接",
         "SYN_SENT": "连接中",
         "SYN_RECV": "握手中",
         "LISTENING": "监听",
+        "TIME_WAIT": "等待超时",
+        "CLOSE_WAIT": "等待关闭",
+        "FIN_WAIT1": "关闭中",
+        "FIN_WAIT2": "关闭中",
+        "LAST_ACK": "关闭中",
+        "CLOSING": "关闭中",
+        "DELETE_TCB": "待回收",
+        "CLOSED": "已关闭",
         "UDP": "UDP",
     }.get(self.state, self.state)
 
@@ -2015,27 +2384,50 @@ def _state_color(self) -> str:
 def _province_display(self) -> str:
     geo = self.geo or {}
     if not geo:
-        return "查询中…"
+        return "查询中…" if _geolocatable(self) else "—"
     return geo.get("province") or "—"
 
 
 def _city_display(self) -> str:
     geo = self.geo or {}
     if not geo:
-        return "查询中…"
+        return "查询中…" if _geolocatable(self) else "—"
     return geo.get("city") or "—"
 
 
 def _district_display(self) -> str:
     geo = self.geo or {}
     if not geo:
-        return "查询中…"
+        return "查询中…" if _geolocatable(self) else "—"
     return geo.get("district") or "—"
+
+
+def _coord_display(self) -> str:
+    """经纬度单元格：`31.2304, 121.4740`。
+
+    逗号后留一个空格是给人读的（纯机器读的紧凑串由 coords_pair 提供，
+    右键「复制经纬度」拿的是那个）。没定位到返回「—」，
+    而不是空串 —— 空着会让人以为是渲染丢字。
+    """
+    geo = self.geo or {}
+    if not geo:
+        return "查询中…" if _geolocatable(self) else "—"
+    if not geo.get("ok"):
+        return "—"
+    pair = geoloc.coords_pair(geo)
+    if not pair:
+        return "—"
+    lat, _, lon = pair.partition(",")
+    return f"{lat}, {lon}"
 
 
 def _network_display(self) -> str:
     geo = self.geo or {}
     if not geo:
+        if not _geolocatable(self):
+            # 本机 / 局域网 / 组播连接不会去查地理位置（免费库也查不到），
+            # 写「查询中…」会让人一直等一个永远不会来的结果。
+            return f"{NET_LABEL.get(self.net_kind, '非公网')}连接　（不查地理位置）"
         # 还没查到，明确区别于「查不到」——否则用户会以为是没结果
         return "查询中…"
     if not geo.get("ok"):
@@ -2048,8 +2440,9 @@ def _network_display(self) -> str:
         tags.append("云机房")
     if tags:
         return f"{net}　[{'/'.join(tags)}]" if net else "、".join(tags)
-    # 这里**不要**再按字符数截 —— 单元格渲染时会用 fit_text 按像素宽
-    # 补省略号。两处都截会导致「先被砍一半、再补省略号」，中间那段白丢。
+    # 这里**不要**再按字符数截 —— 列宽由 _measure_net_width 按真实最长值
+    # 自动量出来（用户要求这一列显示全称）；真要超 960px 上限时，
+    # 才是 fit_net_text 的兜底截断上场。
     return net or "—"
 
 
@@ -2059,6 +2452,7 @@ Connection.scan_state_color = _state_color
 Connection.scan_province_display = _province_display
 Connection.scan_city_display = _city_display
 Connection.scan_district_display = _district_display
+Connection.scan_coord_display = _coord_display
 Connection.scan_network_display = _network_display
 
 

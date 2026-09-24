@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -131,6 +132,10 @@ PROVINCE_CN_EN = {
     "western cape": "西开普", "catalonia": "加泰罗尼亚",
     "north holland": "北荷兰", "south holland": "南荷兰",
     "lombardy": "伦巴第", "sao paulo": "圣保罗", "dublin": "都柏林",
+    # 城邦国家的「省」级字段常直接给城市/国家名，统一成中文免得表里中英混排
+    "central singapore": "新加坡", "singapore": "新加坡",
+    "kuala lumpur": "吉隆坡", "jakarta": "雅加达", "bangkok": "曼谷",
+    "taipei": "台北", "hong kong": "香港", "macao": "澳门",
 }
 
 # 繁体 / 异体国名（部分库用繁体返回）统一成简体
@@ -291,9 +296,63 @@ def _cache_get(ip: str):
     if isinstance(rec, dict):
         if rec.get("_v") != CACHE_VERSION:
             return None
+        # 解坏过（含 U+FFFD）的记录，原文已经丢了，留着复用等于一直展示乱码，
+        # 直接当作未命中，让它重新联网查一次。
+        if any(has_broken_text(rec.get(k)) for k in
+               ("country", "province", "region", "city", "district",
+                "datacenter", "isp", "org")):
+            return None
         if time.time() - rec.get("_ts", 0) < CACHE_TTL:
-            return rec
+            _ensure_cache_sanitized()
+            return _CACHE.get(ip)
     return None
+
+
+def _sanitize_record(rec: dict) -> dict:
+    """对缓存里的旧记录重跑一遍清洗与地理名规范化。
+
+    规范化规则的改动（比如清掉「台湾省 or 台湾」这种畸形串、扩展繁简映射）
+    不会自动作用到旧缓存上，否则会一直命中旧值、看起来像「改了没用」。
+    这里在读取时原地重算，不必清缓存重新联网。
+    """
+    if not isinstance(rec, dict) or not rec.get("ok"):
+        return rec
+    out = dict(rec)
+    out["country"] = normalize_country(rec.get("country", ""))
+    prov = _norm_province(rec.get("province") or rec.get("region") or "")
+    out["province"] = prov
+    out["region"] = prov
+    out["city"] = _norm_city(rec.get("city", ""))
+    out["district"] = _norm_district(rec.get("district", ""))
+    for key in ("isp", "org", "as", "hostname"):
+        if rec.get(key):
+            out[key] = clean_text(rec[key])
+    dc, is_cloud, is_cdn = detect_datacenter(
+        out.get("org", ""), out.get("isp", ""), out.get("as", ""),
+        rec.get("is_cloud"))
+    out["datacenter"] = dc or clean_text(rec.get("datacenter", ""))
+    out["is_cloud"] = is_cloud
+    out["is_cdn"] = is_cdn
+    return out
+
+
+_sanitized = [False]
+
+
+def _ensure_cache_sanitized() -> None:
+    """首次访问缓存时，把整份缓存过一遍清洗（只跑一次）。"""
+    if _sanitized[0]:
+        return
+    _sanitized[0] = True
+    changed = 0
+    with _cache_lock:
+        for ip, rec in list(_CACHE.items()):
+            new = _sanitize_record(rec)
+            if new != rec:
+                _CACHE[ip] = new
+                changed += 1
+        if changed:
+            _save_cache(_CACHE)
 
 
 def _cache_put(ip: str, data: dict) -> None:
@@ -316,7 +375,7 @@ def normalize_country(name: str) -> str:
     """国家/地区名中文化 + 台湾港澳口径统一。"""
     if not name:
         return ""
-    raw = (name or "").strip()
+    raw = clean_text(name)
     key = _norm_text(raw)
     if key in REGION_ALIASES:
         return REGION_ALIASES[key]
@@ -356,6 +415,11 @@ _TRAD_CHARS = {
     "奧": "奥", "地": "地", "比": "比", "時": "时", "冰": "冰",
     "島": "岛", "中": "中", "英": "英", "法": "法", "美": "美",
     "日": "日", "本": "本", "新": "新", "加": "加", "坡": "坡",
+    # 城市名里高频出现、上面那批没覆盖到的
+    "薩": "萨", "費": "费", "達": "达", "別": "别", "東": "东",
+    "廣": "广", "蘇": "苏", "興": "兴", "約": "约", "門": "门",
+    "開": "开", "聖": "圣", "維": "维", "納": "纳",
+    "倫": "伦", "頓": "顿", "鳳": "凤",
 }
 
 
@@ -365,10 +429,12 @@ def _to_simplified(text: str) -> str:
 
 
 def _norm_city(name: str) -> str:
-    """城市名规范化：繁体转简体、英文转中文。"""
+    """城市名规范化：清脏串、繁体转简体、英文转中文。"""
     if not name:
         return ""
-    city = name.strip()
+    city = clean_text(name)
+    if not city:
+        return ""
     if city in TRAD_TO_SIMP:
         return TRAD_TO_SIMP[city]
     # 繁体字转简体（紐約 → 纽约）
@@ -382,17 +448,22 @@ def _norm_city(name: str) -> str:
         low = city.lower()
         if low in PLACE_CN:
             return PLACE_CN[low]
+    # 上游给的写法与我们的紧凑口径不一致时单独修正（首尔特别市 → 首尔）
+    if city in _PLACE_FIXUPS:
+        return _PLACE_FIXUPS[city]
     # 去掉「市」后缀，和省份的「省」后缀保持一致的紧凑风格
     if city.endswith("市") and len(city) > 1:
         city = city[:-1]
-    return city
+    return _PLACE_FIXUPS.get(city, city)
 
 
 def _norm_province(value: str) -> str:
-    """省/州名规范化：直辖市/自治区/特别行政区去后缀；英文州名转中文。"""
+    """省/州名规范化：清脏串、直辖市/自治区/特别行政区去后缀；英文州名转中文。"""
     if not value:
         return ""
-    raw = value.strip()
+    raw = clean_text(value)
+    if not raw:
+        return ""
     # 已经是中文：走全名→简称映射，拿不到就去掉常见后缀
     if any("\u4e00" <= ch <= "\u9fff" for ch in raw):
         if raw in PROVINCE_CN_FULL:
@@ -426,6 +497,201 @@ def _norm_district(value: str) -> str:
         if d.endswith(suf) and len(d) > len(suf):
             return d[:-len(suf)]
     return d
+
+
+# ---------------------------------------------------------------- 脏字符串清洗
+#
+# 免费库的字段并不总是干净的。实测遇到的「看起来像中文乱码」有两类，来源完全不同：
+#
+# 1. **真的编码损坏**。整串被按错的编码解过一次（UTF-8 字节当 latin-1 解，会
+#    出现「ä¸Šæµ·」这种拉丁字母堆叠）；或者已经解出了 U+FFFD 替换字符，
+#    原文彻底丢了，只能靠重新查询。
+# 2. **上游数据本身就是畸形串**。最典型的是 ip-api 的 zh-CN 译文把两种写法
+#    一起返回：`regionName = "台湾省 or 台湾"`。它不是乱码，但显示出来一样
+#    像坏了，同样必须清掉。
+#
+# 两类都在这里收口，展示层不必再各自打补丁。
+
+# 可能的（错误编码 → 正确编码）组合。按命中概率排序。
+_MOJIBAKE_PAIRS = (("latin-1", "utf-8"), ("cp1252", "utf-8"), ("gbk", "utf-8"))
+
+# 拉丁字母扩展区 + C1 控制区里的字符：正常地名里几乎不出现，出现即高度可疑
+# （C1 控制区 U+0080~U+009F 尤其典型：它正是 UTF-8 字节被按 cp1252/latin-1
+# 解过之后残留的痕迹，真实地名里绝不会有。）
+_SUSPECT_CHARS = re.compile(
+    r"[\u0080-\u009f\u00c0-\u00ff\u0152\u0153\u0160\u0161\u017d\u017e]")
+
+# 上游把两种写法一起返回时的分隔：`台湾省 or 台湾`
+_ALT_SEP = re.compile(r"\s+or\s+", re.I)
+
+# 零宽字符与替换字符
+_JUNK_CHARS = str.maketrans({"\ufffd": "", "\u200b": "", "\u200e": "",
+                             "\u200f": "", "\ufeff": ""})
+
+# 规范化之后再做一次的特例修正：上游给的写法与我们的紧凑口径不一致
+_PLACE_FIXUPS = {
+    "首尔特别市": "首尔", "首尔特别": "首尔", "首爾特別市": "首尔",
+    "中央新加坡": "新加坡",
+}
+
+
+def _looks_broken(text: str) -> bool:
+    return "\ufffd" in text or bool(_SUSPECT_CHARS.search(text))
+
+
+def _candidate_bytes(text: str):
+    """列出「这段文字可能是被解过的字节」的所有还原尝试。"""
+    out = []
+    raw = _lenient_bytes(text)
+    if raw is not None:
+        out.append(raw)
+    for src, _dst in _MOJIBAKE_PAIRS:
+        try:
+            b = text.encode(src)
+        except (UnicodeEncodeError, LookupError):
+            continue
+        if b not in out:
+            out.append(b)
+    return out
+
+
+# cp1252 的 0x80~0x9F 段不是照 latin-1 映射的，得单独反过来查。
+# UTF-8 字节被按 cp1252 解出来的乱码里，这一段会变成 ±™Œ— 这类符号，
+# 正是靠这张表才能把原始字节凑回去。
+_CP1252_BYTES = {
+    0x80: "\u20ac", 0x82: "\u201a", 0x83: "\u0192", 0x84: "\u201e",
+    0x85: "\u2026", 0x86: "\u2020", 0x87: "\u2021", 0x88: "\u02c6",
+    0x89: "\u2030", 0x8a: "\u0160", 0x8b: "\u2039", 0x8c: "\u0152",
+    0x8e: "\u017d", 0x91: "\u2018", 0x92: "\u2019", 0x93: "\u201c",
+    0x94: "\u201d", 0x95: "\u2022", 0x96: "\u2013", 0x97: "\u2014",
+    0x98: "\u02dc", 0x99: "\u2122", 0x9a: "\u0161", 0x9b: "\u203a",
+    0x9c: "\u0153", 0x9e: "\u017e", 0x9f: "\u0178",
+}
+_CP1252_REV = {ord(ch): b for b, ch in _CP1252_BYTES.items()}
+
+
+def _lenient_bytes(text: str):
+    """逐字符把乱码凑回原始字节。凑不出来返回 None。
+
+    比 `encode('cp1252')` 宽容：C1 控制字符（U+0080~U+009F）直接按原值取，
+    cp1252 的特有符号查表反推 —— 两种真实乱码里都会混着出现。
+    """
+    buf = bytearray()
+    for ch in text:
+        o = ord(ch)
+        if o <= 0xFF:
+            buf.append(o)
+        elif o in _CP1252_REV:
+            buf.append(_CP1252_REV[o])
+        else:
+            return None
+    return bytes(buf)
+
+
+def _is_better(before: str, after: str) -> bool:
+    """还原后的串是否明显更合理。判据保守，避免误伤正常外文地名。"""
+    if not after or after == before:
+        return False
+    if "\ufffd" in before and "\ufffd" not in after:
+        return True
+    had_ctrl = any("\u0080" <= c <= "\u009f" for c in before)
+    has_ctrl = any("\u0080" <= c <= "\u009f" for c in after)
+    if had_ctrl and not has_ctrl:
+        return True
+    before_cjk = any("\u4e00" <= c <= "\u9fff" for c in before)
+    after_cjk = any("\u4e00" <= c <= "\u9fff" for c in after)
+    return after_cjk and not before_cjk
+
+
+def _repair_mojibake(text: str) -> str:
+    """把「编码解错」的串还原回去；认不出来就原样返回。
+
+    只在原串确实可疑、且还原结果明显更合理时才替换，所以
+    `Rīga` / `Ōsaka` / `Düsseldorf` 这类正常的外文地名不会被误伤。
+    """
+    if not _looks_broken(text):
+        return text
+    out = text
+    for raw in _candidate_bytes(out):
+        try:
+            fixed = raw.decode("utf-8")
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        if _is_better(out, fixed):
+            out = fixed
+            break
+    return out
+
+
+def clean_text(value: str) -> str:
+    """清掉编码损坏、零宽字符，以及「A or B」这类上游畸形串。
+
+    只做「减」，不做地理名规范化 —— 规范化由 _norm_* 各函数负责。
+    """
+    if not value:
+        return ""
+    s = str(value).translate(_JUNK_CHARS).strip()
+    s = _ALT_SEP.split(s, maxsplit=1)[0].strip()
+    s = _repair_mojibake(s)
+    # 还原后再去掉可能残留的零宽字符，并压缩连续空白
+    s = s.translate(_JUNK_CHARS)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
+def _fix_place(name: str) -> str:
+    return _PLACE_FIXUPS.get(name, name)
+
+
+def has_broken_text(value: str) -> bool:
+    """该字段是否被解坏过（U+FFFD 无法还原，只能重新查询）。"""
+    return bool(value) and "\ufffd" in str(value)
+
+
+# ---------------------------------------------------------------- 经纬度
+
+def _num(value):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    # 有些库拿不到坐标时给 0,0（几内亚湾），当无效处理
+    if f != f or abs(f) > 180.0:
+        return None
+    return f
+
+
+def has_coords(geo: dict) -> bool:
+    lat, lon = _num((geo or {}).get("lat")), _num((geo or {}).get("lon"))
+    return lat is not None and lon is not None and not (lat == 0 and lon == 0)
+
+
+def coords_pair(geo: dict, digits: int = 4) -> str:
+    """紧凑坐标 `31.2304,121.4740`；没有坐标返回空串。"""
+    if not has_coords(geo):
+        return ""
+    return f"{(geo.get('lat')):.{digits}f},{(geo.get('lon')):.{digits}f}"
+
+
+def describe_coords(geo: dict, digits: int = 4) -> str:
+    """人读坐标 `31.2304°N, 121.4740°E`；没有坐标返回空串。"""
+    if not has_coords(geo):
+        return ""
+    lat, lon = float(geo["lat"]), float(geo["lon"])
+    ns = "N" if lat >= 0 else "S"
+    ew = "E" if lon >= 0 else "W"
+    return (f"{abs(lat):.{digits}f}°{ns}, {abs(lon):.{digits}f}°{ew}")
+
+
+def map_url(geo: dict, digits: int = 5) -> str:
+    """给坐标生成一个高德地图打点链接（国内可直接打开）。"""
+    if not has_coords(geo):
+        return ""
+    lon, lat = float(geo["lon"]), float(geo["lat"])
+    name = (geo.get("datacenter") or geo.get("isp") or "机房")
+    from urllib.parse import quote
+    return (f"https://uri.amap.com/marker?position={lon:.{digits}f},"
+            f"{lat:.{digits}f}&name={quote(str(name)[:40])}")
 
 
 def detect_datacenter(org: str, isp: str, as_field: str, hosting=None):
@@ -618,7 +884,9 @@ def _curl(url: str, timeout: int = HTTP_TIMEOUT, encoding: str = "utf-8"):
                 return body
         except (OSError, subprocess.SubprocessError):
             pass
-    return _urllib_get(url, timeout)
+    # 兜底那条路必须带上同一个 encoding —— PConline 返回 GBK，
+    # 用 UTF-8 解就会解出「????ʡ」这种中文乱码（实测踩过）。
+    return _urllib_get(url, timeout, encoding)
 
 
 def _find_curl():
@@ -633,12 +901,14 @@ def _find_curl():
     return None
 
 
-def _urllib_get(url: str, timeout: int = HTTP_TIMEOUT):
+def _urllib_get(url: str, timeout: int = HTTP_TIMEOUT, encoding: str = "utf-8"):
+    """标准库兜底。encoding 必须与调用方（curl 那条路）保持一致，
+    否则 GBK 接口会被按 UTF-8 解成乱码。"""
     import urllib.request
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", "replace").strip()
+            return resp.read().decode(encoding, "replace").strip()
     except Exception:
         return ""
 
@@ -913,9 +1183,11 @@ def _finalize(ip: str, raw: dict) -> dict:
     province = _norm_province(raw.get("region", ""))
     city = _norm_city(raw.get("city", ""))
     district = _norm_district(raw.get("district", ""))
-    isp = (raw.get("isp") or "").strip()
-    org = (raw.get("org") or "").strip()
-    as_field = (raw.get("as") or "").strip()
+    # 运营商 / 机房名一律只清洗、不缩写：这列要显示全称（用户明确要求），
+    # 宽度由表格自适应，不能用截断来省地方。
+    isp = clean_text(raw.get("isp") or "")
+    org = clean_text(raw.get("org") or "")
+    as_field = clean_text(raw.get("as") or "")
     hosting = raw.get("hosting")
 
     dc, is_cloud, is_cdn = detect_datacenter(org, isp, as_field, hosting)
@@ -935,7 +1207,7 @@ def _finalize(ip: str, raw: dict) -> dict:
         "datacenter": dc,
         "is_cloud": is_cloud,
         "is_cdn": is_cdn,
-        "hostname": raw.get("hostname", ""),
+        "hostname": clean_text(raw.get("hostname", "")),
         "lat": raw.get("lat"),
         "lon": raw.get("lon"),
         "timezone": raw.get("timezone", ""),

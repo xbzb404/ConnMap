@@ -41,6 +41,38 @@ NET_LABEL = {
     NET_UNKNOWN: "未知",
 }
 
+# ---------------------------------------------------------------- 连接状态
+
+# netstat 的状态写法**有两套**，同一条连接在两边叫法不同：
+#   Windows 用下划线：FIN_WAIT_1 / FIN_WAIT_2 / SYN_RECEIVED
+#   类 Unix 不用下划线：FIN_WAIT1 / FIN_WAIT2 / SYN_RECV
+# 实测本机（中文 Windows）的 FIN_WAIT_2 就带下划线。
+# 若只按其中一套写判断条件，另一套会静默漏过去 —— 之前就漏掉了 6 条
+# 已进入关闭流程的残留连接（状态列还因为超宽被切成 `FIN_W`，看着像出错）。
+# 所以统一在这里归一化成「无下划线」这一套，后面所有判断只认归一值。
+_STATE_ALIASES = {
+    "FIN_WAIT_1": "FIN_WAIT1",
+    "FIN_WAIT_2": "FIN_WAIT2",
+    "SYN_RECEIVED": "SYN_RECV",
+    "SYN_RECV": "SYN_RECV",
+    "LISTEN": "LISTENING",
+    "LISTENING": "LISTENING",
+}
+
+# 已经走完（或正在走）关闭流程、不再代表「当前正在连的服务器」的状态。
+# 留着只会把结果淹掉 —— 实测 46 条记录里一大半是它们。
+STALE_STATES = (
+    "TIME_WAIT", "CLOSE_WAIT",
+    "FIN_WAIT1", "FIN_WAIT2",
+    "LAST_ACK", "CLOSING", "DELETE_TCB", "CLOSED",
+)
+
+
+def normalize_state(state: str) -> str:
+    """把两套写法归一化到同一套（无下划线那套）。"""
+    s = (state or "").strip().upper()
+    return _STATE_ALIASES.get(s, s)
+
 
 def classify_ip(ip: str) -> str:
     """判断一个 IP 属于哪类网络。无法解析时按「本机」处理，避免误报成公网。"""
@@ -132,7 +164,8 @@ class Connection:
 
     @property
     def is_active(self) -> bool:
-        return self.state in ("ESTABLISHED", "SYN_SENT", "SYN_RECV", "CLOSE_WAIT")
+        return self.state in ("ESTABLISHED", "SYN_SENT", "SYN_RECV",
+                             "CLOSE_WAIT")
 
     @property
     def is_listening(self) -> bool:
@@ -512,6 +545,8 @@ def list_connections(include_local: bool = True, include_listening: bool = False
                 # TCP 少数情况缺状态，跳过
                 continue
             local, remote, state, pid_s = parts[1], parts[2], parts[3], parts[4]
+            # 归一化状态写法（Windows 的 FIN_WAIT_2 → FIN_WAIT2 等）
+            state = normalize_state(state)
 
         try:
             pid = int(pid_s)
@@ -545,9 +580,9 @@ def collect(include_local: bool = False, include_listening: bool = False,
 
     min_kind=NET_PUBLIC 时只返回公网连接；=NET_LAN 时连局域网一起返回。
 
-    include_stale=False 会丢掉 TIME_WAIT / CLOSE_WAIT 这类已经结束、
-    还挂在表里的残留项——它们不是「当前正在连接」的服务器，留着会把
-    结果淹掉（实测 46 条里有一大半是它）。
+    include_stale=False 会丢掉 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_1 / FIN_WAIT_2
+    这类已经结束、还挂在表里的残留项——它们不是「当前正在连接」的服务器，
+    留着会把结果淹掉（实测 46 条里有一大半是它）。
     include_system=False 会丢掉 PID 0/4 的内核连接表项。
     """
     allow = {NET_PUBLIC} if min_kind == NET_PUBLIC else {NET_PUBLIC, NET_LAN}
@@ -556,9 +591,7 @@ def collect(include_local: bool = False, include_listening: bool = False,
     for c in list_connections(include_local=True, include_listening=include_listening):
         if c.net_kind not in allow:
             continue
-        if not include_stale and c.state in ("TIME_WAIT", "CLOSE_WAIT",
-                                             "FIN_WAIT1", "FIN_WAIT2",
-                                             "LAST_ACK", "CLOSING", "TIME_WAIT"):
+        if not include_stale and c.state in STALE_STATES:
             continue
         # PID 0 是内核空闲进程，netstat 把系统级连接表项挂在它下面；
         # PID 4 是内核本身。它们不对应任何用户应用。

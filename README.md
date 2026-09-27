@@ -61,9 +61,11 @@ python app.py
 **命令行自测**（不启界面）：
 
 ```bash
-python connscan.py                 # 列出所有公网连接（按进程分组）
-python connscan.py --all           # 连局域网连接一起列
+python connscan.py                 # 只列公网连接（按进程分组）
+python connscan.py --all           # 含局域网
+python connscan.py --all --listen  # 再带上本机监听端口（查自己开的服务端口用这个）
 python geoloc.py 8.8.8.8 1.1.1.1   # 单查某几个 IP 的归属
+python geoloc.py --batch ips.txt   # 从文件批量查（每行一个 IP）
 python geoloc.py --cache-info      # 看地理缓存状态
 python geoloc.py --clear-cache     # 清空缓存
 ```
